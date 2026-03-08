@@ -51,8 +51,10 @@ app = FastAPI()
 
 STATE: Dict[str, Any] = {}
 
+SERVICE_ACCOUNT_FILE = "service-account.json"
 FCM_PROJECT_ID = os.environ.get("FCM_PROJECT_ID", "contextagent-cf19e")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-nano")
+
 OPENAI_ENABLED = bool(os.environ.get("OPENAI_API_KEY"))
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_ENABLED else None
