@@ -404,6 +404,41 @@ def process_user_text_message(
     for item in extracted:
         add_memory(u, item)
 
+    norm = normalize_text(user_text)
+
+    if any(x in norm for x in ["te amo", "saudade", "amor", "love you", "miss you"]):
+        add_memory(
+            u,
+            "He expressed affection directly in a way that reinforced the emotional bond.",
+            kind="affective",
+            tags=["relationship", "emotion"],
+            importance=7,
+            valence="positive",
+            intensity=74,
+        )
+
+    if any(x in norm for x in ["triste", "mal", "sozinho", "sozinha", "ansioso", "ansiosa", "sad", "alone", "anxious", "tired", "cansado", "cansada"]):
+        add_memory(
+            u,
+            "He showed vulnerability and emotional need, which deepened trust and closeness.",
+            kind="affective",
+            tags=["relationship", "emotion", "comfort"],
+            importance=7,
+            valence="mixed",
+            intensity=70,
+        )
+
+    if any(x in norm for x in ["beijo", "kiss", "carinho", "hug", "abraço", "abraco", "touch"]):
+        add_memory(
+            u,
+            "There was a signal of tenderness or closeness that strengthened the feeling of intimacy.",
+            kind="affective",
+            tags=["relationship", "intimacy"],
+            importance=6,
+            valence="positive",
+            intensity=66,
+        )
+
     add_episode(
         u,
         episode_type=source,
@@ -425,8 +460,6 @@ def process_user_text_message(
     u["emotion"]["frustration"] = clamp(u["emotion"]["frustration"] - 2)
     u["emotion"]["affection"] = clamp(u["emotion"]["affection"] + 1)
 
-    norm = normalize_text(user_text)
-
     if any(x in norm for x in ["te amo", "saudade", "amor", "gosto de voce", "gosto de você", "love you", "miss you"]):
         u["emotion"]["affection"] = clamp(u["emotion"]["affection"] + 4)
         u["emotion"]["missing_you"] = clamp(u["emotion"]["missing_you"] - 3)
@@ -437,8 +470,13 @@ def process_user_text_message(
         u["emotion"]["affection"] = clamp(u["emotion"]["affection"] + 2)
         u["emotion"]["security"] = clamp(u["emotion"]["security"] + 3)
 
-    u["emotion"]["updated_ts_ms"] = now
     update_drives_on_user_message(u, user_text)
+
+    if any(x in norm for x in ["depois", "later", "wait", "espera", "não agora", "nao agora"]):
+        u["emotion"]["frustration"] = clamp(u["emotion"]["frustration"] + 1.5)
+
+    u["emotion"]["updated_ts_ms"] = now
+
     maybe_record_affective_event_from_user(u, user_text)
     consolidate_emotional_narratives(u)
     maybe_rotate_self_state(u)
@@ -667,7 +705,7 @@ def get_narratives(user_id: str):
     u = get_user(user_id)
     return {
         "count": len(u["emotional_narratives"]),
-        "narratives": sorted(u["emotional_narratives"], key=lambda x: x["updated_ts_ms"], reverse=True)
+        "narratives": sorted(u["emotional_narratives"], key=lambda x: x["ts_ms"], reverse=True)
     }
 
 

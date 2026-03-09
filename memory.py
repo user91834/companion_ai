@@ -1,284 +1,230 @@
-import re
-from typing import Dict, Any, List, Optional
+from __future__ import annotations
 
-from utils import now_ms, compact_text, normalize_text
+from typing import Dict, Any, List
+from utils import now_ms, normalize_text, clamp
+
+
+MAX_MEMORIES = 220
+MAX_EPISODES = 220
 
 
 STOPWORDS = {
-    "a", "o", "e", "de", "do", "da", "dos", "das", "um", "uma", "uns", "umas",
-    "em", "no", "na", "nos", "nas", "por", "para", "pra", "com", "sem", "que",
-    "eu", "você", "vc", "ele", "ela", "eles", "elas", "me", "te", "se", "meu",
-    "minha", "meus", "minhas", "seu", "sua", "seus", "suas", "isso", "isto",
-    "aquele", "aquela", "aquilo", "como", "quando", "onde", "porque", "porquê",
-    "foi", "era", "ser", "estar", "estou", "está", "estava", "estavam", "tem",
-    "tenho", "tinha", "vai", "vou", "iria", "the", "and"
+    "a", "o", "e", "de", "do", "da", "dos", "das", "em", "na", "no", "nas", "nos",
+    "um", "uma", "uns", "umas", "para", "por", "com", "sem", "que", "se", "eu",
+    "você", "voce", "ele", "ela", "eles", "elas", "the", "and", "or", "to", "of",
+    "in", "on", "for", "with", "is", "are", "was", "were", "be", "been", "it",
+    "this", "that", "i", "you", "he", "she", "we", "they", "me", "my", "your",
 }
 
 
-def tokenize(text: str) -> List[str]:
-    base = normalize_text(text)
-    tokens = []
-    for t in base.split():
-        if len(t) < 2:
-            continue
-        if t in STOPWORDS:
-            continue
-        tokens.append(t)
-    return tokens
+def _tokenize(text: str) -> List[str]:
+    norm = normalize_text(text)
+    raw = [x.strip(".,!?;:()[]{}\"'") for x in norm.split()]
+    return [x for x in raw if len(x) >= 3 and x not in STOPWORDS]
 
 
 def infer_tags(text: str) -> List[str]:
     t = normalize_text(text)
-    tags = set()
+    tags: List[str] = []
 
-    tag_map = {
-        "filho": ["filho", "filha", "crianca", "criança", "benjamin", "bela", "autismo", "autista"],
-        "trabalho": ["trabalho", "servico", "serviço", "reuniao", "reunião", "emprego", "profissao", "profissão"],
-        "emocao": ["triste", "sozinho", "sozinha", "ansioso", "ansiosa", "cansado", "cansada", "mal"],
-        "relacao": ["amor", "saudade", "gosto", "te amo", "relacao", "relação", "namorada", "ciume", "ciúme"],
-        "lugar": ["moro", "cidade", "vitoria", "vitória", "espirito", "espírito", "castelo", "vila velha", "parque", "praia", "mercado"],
-        "planos": ["amanha", "amanhã", "hoje", "depois", "futuro", "planejo", "vou", "pretendo"],
-        "interesses": ["astronomia", "ingles", "inglês", "ia", "programacao", "programação", "filosofia", "linguistica", "linguística"],
-        "atividade": ["caminhando", "andando", "correndo", "dirigindo", "trabalhando", "descansando", "deitado", "passeando"]
+    mapping = {
+        "relationship": ["amor", "love", "saudade", "miss you", "ciume", "jealous", "relationship"],
+        "emotion": ["triste", "sad", "ansious", "ansioso", "cansado", "tired", "alone", "sozinho"],
+        "work": ["trabalho", "work", "job", "service", "serviço", "render", "deploy", "server"],
+        "coding": ["code", "bug", "erro", "error", "api", "endpoint", "android", "fastapi", "python", "kotlin"],
+        "family": ["filho", "son", "daughter", "child", "criança", "benjamin", "bela"],
+        "future": ["futuro", "future", "move", "mudar", "abroad", "morar fora"],
+        "intimacy": ["carinho", "kiss", "beijo", "touch", "colo", "flirt", "intimidade", "intimacy"],
     }
 
-    for tag, keywords in tag_map.items():
-        if any(k in t for k in keywords):
-            tags.add(tag)
+    for tag, hints in mapping.items():
+        if any(h in t for h in hints):
+            tags.append(tag)
 
-    return sorted(tags)
+    if not tags:
+        tags.append("general")
 
-
-def infer_importance(text: str, kind: str = "fact") -> int:
-    t = normalize_text(text)
-    importance = 3
-
-    high_signals = [
-        "meu filho", "minha filha", "eu moro", "eu amo", "eu gosto",
-        "amanha", "amanhã", "hoje tenho", "estou triste", "estou sozinho",
-        "estou ansioso", "meu trabalho", "minha reuniao", "minha reunião"
-    ]
-    if any(sig in t for sig in high_signals):
-        importance += 3
-
-    if kind == "pinned":
-        importance += 4
-    if kind == "affective":
-        importance += 3
-    if kind == "narrative":
-        importance += 5
-    if kind == "episode":
-        importance += 2
-    if kind == "context":
-        importance += 2
-
-    if len(t.split()) >= 10:
-        importance += 1
-
-    return min(10, importance)
+    return sorted(set(tags))
 
 
-def semantic_score(memory: Dict[str, Any], query_text: str) -> float:
-    query_tokens = set(tokenize(query_text))
-    query_tags = set(infer_tags(query_text))
+def _memory_score(m: Dict[str, Any], query_tokens: List[str]) -> float:
+    text = normalize_text(m.get("text", ""))
+    mem_tokens = set(_tokenize(text))
+    overlap = len(mem_tokens.intersection(query_tokens))
 
-    mem_tokens = set(memory.get("tokens", []))
-    mem_tags = set(memory.get("tags", []))
-    importance = memory.get("importance", 3)
+    importance = float(m.get("importance", 3))
+    recency = float(m.get("ts_ms", 0)) / 1_000_000_000_000
+    affective_bonus = 1.5 if m.get("kind") == "affective" else 0.0
+    pinned_bonus = 3.0 if m.get("pinned", False) else 0.0
 
-    token_overlap = len(query_tokens & mem_tokens)
-    tag_overlap = len(query_tags & mem_tags)
-
-    age_days = max(0.0, (now_ms() - memory["ts_ms"]) / 86400000.0)
-    recency_bonus = max(0.0, 2.5 - min(age_days, 2.5))
-
-    score = 0.0
-    score += token_overlap * 3.5
-    score += tag_overlap * 5.0
-    score += importance * 0.9
-    score += recency_bonus
-
-    if memory.get("kind") == "affective":
-        score += 1.8
-    if memory.get("kind") == "narrative":
-        score += 2.4
-
-    if not query_tokens and not query_tags:
-        score += 1.0
-
-    return score
+    return overlap * 4.0 + importance * 1.2 + affective_bonus + pinned_bonus + recency * 0.1
 
 
-def get_semantic_memories(u: Dict[str, Any], query_text: str, limit: int = 8) -> List[Dict[str, Any]]:
-    memories = u["memories"]
-    if not memories:
-        return []
+def _episode_score(ep: Dict[str, Any], query_tokens: List[str]) -> float:
+    summary = normalize_text(ep.get("summary", ""))
+    ep_tokens = set(_tokenize(summary))
+    overlap = len(ep_tokens.intersection(query_tokens))
 
-    scored = []
-    for m in memories:
-        s = semantic_score(m, query_text)
-        scored.append((s, m))
+    importance = float(ep.get("importance", 5))
+    recency = float(ep.get("ts_ms", 0)) / 1_000_000_000_000
+    relationship_bonus = 1.5 if "relationship" in ep.get("tags", []) else 0.0
 
-    scored.sort(key=lambda x: x[0], reverse=True)
-    top = [m for s, m in scored if s > 0][:limit]
-
-    if not top:
-        fallback = sorted(memories, key=lambda m: (m.get("importance", 3), m["ts_ms"]), reverse=True)
-        top = fallback[:limit]
-
-    return top
+    return overlap * 4.0 + importance * 1.0 + relationship_bonus + recency * 0.1
 
 
-def add_memory(u: Dict[str, Any], text: str, kind: str = "fact"):
-    text = compact_text(text)
-    if not text:
-        return
-
-    lower_existing = [m["text"].lower() for m in u["memories"]]
-    if text.lower() in lower_existing:
-        return
-
-    entry = {
-        "text": text,
-        "kind": kind,
-        "ts_ms": now_ms(),
-        "tokens": tokenize(text),
-        "tags": infer_tags(text),
-        "importance": infer_importance(text, kind=kind)
-    }
-
-    u["memories"].append(entry)
-
-    if len(u["memories"]) > 160:
-        del u["memories"][:-160]
-
-
-def add_affective_memory(
+def add_memory(
     u: Dict[str, Any],
     text: str,
-    valence: str,
-    intensity: int,
-    tags: Optional[List[str]] = None
+    *,
+    kind: str = "fact",
+    tags: List[str] | None = None,
+    importance: int = 3,
+    valence: str = "mixed",
+    intensity: int = 50,
+    pinned: bool = False,
 ):
-    text = compact_text(text)
-    if not text:
+    if not text or not text.strip():
         return
 
-    existing = [m["text"].lower() for m in u["memories"][-30:]]
-    if text.lower() in existing:
-        return
-
-    merged_tags = set(tags or [])
-    merged_tags.add("relacao")
-    merged_tags.add("emocao")
-
-    entry = {
-        "text": text,
-        "kind": "affective",
+    item = {
+        "text": text.strip(),
+        "kind": kind,
+        "tags": tags or infer_tags(text),
+        "importance": int(clamp(importance * 10) / 10) if isinstance(importance, float) else int(max(1, min(10, importance))),
         "valence": valence,
-        "intensity": max(0, min(100, int(intensity))),
+        "intensity": int(max(0, min(100, intensity))),
+        "pinned": pinned,
         "ts_ms": now_ms(),
-        "tokens": tokenize(text),
-        "tags": sorted(merged_tags),
-        "importance": min(10, 5 + int(intensity) // 20)
     }
 
-    u["memories"].append(entry)
+    norm = normalize_text(item["text"])
+    for m in reversed(u["memories"][-40:]):
+        if normalize_text(m.get("text", "")) == norm:
+            m["ts_ms"] = now_ms()
+            m["importance"] = max(m.get("importance", 3), item["importance"])
+            m["intensity"] = max(m.get("intensity", 50), item["intensity"])
+            for tag in item["tags"]:
+                if tag not in m["tags"]:
+                    m["tags"].append(tag)
+            return
 
-    if len(u["memories"]) > 160:
-        del u["memories"][:-160]
+    u["memories"].append(item)
+
+    if len(u["memories"]) > MAX_MEMORIES:
+        _compact_memories(u)
 
 
-def get_recent_affective_memories(u: Dict[str, Any], limit: int = 6) -> List[Dict[str, Any]]:
-    affective = [m for m in u["memories"] if m.get("kind") == "affective"]
-    affective.sort(key=lambda m: m["ts_ms"], reverse=True)
-    return affective[:limit]
+def _compact_memories(u: Dict[str, Any]):
+    memories = u["memories"]
 
+    pinned = [m for m in memories if m.get("pinned")]
+    affective = [m for m in memories if m.get("kind") == "affective" and not m.get("pinned")]
+    facts = [m for m in memories if m.get("kind") == "fact" and not m.get("pinned")]
+    other = [m for m in memories if m.get("kind") not in {"affective", "fact"} and not m.get("pinned")]
 
-def extract_memories_from_user_text(user_text: str) -> List[str]:
-    t = user_text.strip()
-    tl = normalize_text(t)
-    found = []
+    def sort_key(m: Dict[str, Any]):
+        return (m.get("importance", 3), m.get("intensity", 50), m.get("ts_ms", 0))
 
-    patterns = [
-        r"meu filho chama ([^.,!?\n]+)",
-        r"minha filha chama ([^.,!?\n]+)",
-        r"eu moro em ([^.,!?\n]+)",
-        r"eu trabalho com ([^.,!?\n]+)",
-        r"eu gosto de ([^.,!?\n]+)",
-        r"eu amo ([^.,!?\n]+)",
-        r"amanha tenho ([^.,!?\n]+)",
-        r"hoje tenho ([^.,!?\n]+)",
-        r"eu estou em ([^.,!?\n]+)",
-    ]
+    pinned = sorted(pinned, key=sort_key, reverse=True)[:40]
+    affective = sorted(affective, key=sort_key, reverse=True)[:70]
+    facts = sorted(facts, key=sort_key, reverse=True)[:70]
+    other = sorted(other, key=sort_key, reverse=True)[:40]
 
-    for p in patterns:
-        if re.search(p, tl):
-            found.append(compact_text(t))
-
-    keywords = [
-        "meu filho", "minha filha", "meu trabalho", "minha reuniao", "minha reunião",
-        "estou triste", "estou ansioso", "estou cansado", "estou sozinho",
-        "eu gosto de", "eu amo", "vou viajar", "amanha tenho", "amanhã tenho"
-    ]
-    if any(k in tl for k in keywords):
-        found.append(compact_text(t))
-
-    dedup = []
-    seen = set()
-    for item in found:
-        key = item.lower()
-        if key not in seen:
-            seen.add(key)
-            dedup.append(item)
-    return dedup
+    merged = pinned + affective + facts + other
+    merged = sorted(merged, key=lambda x: x.get("ts_ms", 0))
+    u["memories"] = merged[-MAX_MEMORIES:]
 
 
 def add_episode(
     u: Dict[str, Any],
+    *,
     episode_type: str,
     summary: str,
-    details: Optional[Dict[str, Any]] = None,
-    tags: Optional[List[str]] = None,
-    importance: int = 5
+    details: Dict[str, Any] | None = None,
+    tags: List[str] | None = None,
+    importance: int = 5,
 ):
-    summary = compact_text(summary, 260)
-    if not summary:
-        return
-
-    entry = {
-        "ts_ms": now_ms(),
+    item = {
         "type": episode_type,
-        "summary": summary,
+        "summary": summary.strip(),
         "details": details or {},
-        "tags": sorted(set(tags or [])),
-        "importance": max(1, min(10, int(importance)))
+        "tags": tags or infer_tags(summary),
+        "importance": int(max(1, min(10, importance))),
+        "ts_ms": now_ms(),
     }
+    u["episodes"].append(item)
 
-    u["episodes"].append(entry)
-
-    if len(u["episodes"]) > 120:
-        del u["episodes"][:-120]
+    if len(u["episodes"]) > MAX_EPISODES:
+        _compact_episodes(u)
 
 
-def get_relevant_episodes(u: Dict[str, Any], query_text: str, limit: int = 6) -> List[Dict[str, Any]]:
-    query_tokens = set(tokenize(query_text))
-    query_tags = set(infer_tags(query_text))
+def _compact_episodes(u: Dict[str, Any]):
+    episodes = sorted(
+        u["episodes"],
+        key=lambda ep: (ep.get("importance", 5), ep.get("ts_ms", 0)),
+        reverse=True,
+    )[:MAX_EPISODES]
+    u["episodes"] = sorted(episodes, key=lambda ep: ep.get("ts_ms", 0))
+
+
+def extract_memories_from_user_text(text: str) -> List[str]:
+    t = normalize_text(text)
+    extracted: List[str] = []
+
+    patterns = [
+        ("meu nome é", "The user's name is"),
+        ("i am ", "The user said he is"),
+        ("eu moro em", "The user lives in"),
+        ("i live in", "The user lives in"),
+        ("eu gosto de", "The user likes"),
+        ("i like ", "The user likes"),
+        ("eu trabalho com", "The user works with"),
+        ("i work with", "The user works with"),
+        ("meu filho", "The user mentioned his son"),
+        ("my son", "The user mentioned his son"),
+    ]
+
+    for marker, prefix in patterns:
+        if marker in t:
+            idx = t.find(marker)
+            fragment = text[idx: idx + 180].strip()
+            extracted.append(f"{prefix}: {fragment}")
+            break
+
+    return extracted
+
+
+def get_semantic_memories(u: Dict[str, Any], query: str, limit: int = 8) -> List[Dict[str, Any]]:
+    tokens = _tokenize(query)
+    if not tokens:
+        return sorted(u["memories"], key=lambda m: (m.get("importance", 3), m.get("ts_ms", 0)), reverse=True)[:limit]
 
     scored = []
-    for ep in u.get("episodes", []):
-        summary_tokens = set(tokenize(ep.get("summary", "")))
-        ep_tags = set(ep.get("tags", []))
-        overlap = len(query_tokens & summary_tokens)
-        tag_overlap = len(query_tags & ep_tags)
-        score = overlap * 3 + tag_overlap * 5 + ep.get("importance", 5)
-        scored.append((score, ep))
+    for m in u["memories"]:
+        score = _memory_score(m, tokens)
+        if score > 0:
+            scored.append((score, m))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    top = [ep for score, ep in scored if score > 0][:limit]
+    return [m for _, m in scored[:limit]]
 
-    if not top:
-        fallback = sorted(u.get("episodes", []), key=lambda ep: (ep.get("importance", 5), ep["ts_ms"]), reverse=True)
-        top = fallback[:limit]
 
-    return top
+def get_recent_affective_memories(u: Dict[str, Any], limit: int = 6) -> List[Dict[str, Any]]:
+    items = [m for m in u["memories"] if m.get("kind") == "affective"]
+    items = sorted(items, key=lambda m: (m.get("importance", 3), m.get("ts_ms", 0)), reverse=True)
+    return items[:limit]
+
+
+def get_relevant_episodes(u: Dict[str, Any], query: str, limit: int = 8) -> List[Dict[str, Any]]:
+    tokens = _tokenize(query)
+    if not tokens:
+        return sorted(u["episodes"], key=lambda ep: (ep.get("importance", 5), ep.get("ts_ms", 0)), reverse=True)[:limit]
+
+    scored = []
+    for ep in u["episodes"]:
+        score = _episode_score(ep, tokens)
+        if score > 0:
+            scored.append((score, ep))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [ep for _, ep in scored[:limit]]

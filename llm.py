@@ -1,22 +1,35 @@
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 
 from character_profile import CHARACTER_PROFILE
 from emotion import get_relationship_stage, relationship_stage_description
-from memory import get_semantic_memories, get_recent_affective_memories, get_relevant_episodes
+from memory import (
+    get_semantic_memories,
+    get_recent_affective_memories,
+    get_relevant_episodes,
+)
 from narrative import get_recent_narratives
-from utils import now_ms, clamp, normalize_text
+from utils import normalize_text
 
 
 EMOTIONAL_VOICE_HINTS = [
     "love", "miss", "lonely", "sad", "tired", "anxious", "hurt", "affection",
     "saudade", "amor", "triste", "sozinho", "sozinha", "cansado", "cansada",
-    "ansioso", "ansiosa", "carinho", "colo"
+    "ansioso", "ansiosa", "carinho", "colo",
 ]
 
 PRACTICAL_TEXT_HINTS = [
     "price", "code", "error", "bug", "config", "file", "api", "endpoint",
-    "preço", "código", "erro", "arquivo", "configuração", "porta", "endpoint"
+    "preço", "código", "erro", "arquivo", "configuração", "porta", "endpoint",
+    "server", "deploy", "render", "gradle", "android", "fastapi",
 ]
+
+
+def _join_lines(value: Any) -> str:
+    if isinstance(value, list):
+        return "\n".join(f"- {x}" for x in value)
+    if isinstance(value, dict):
+        return "\n".join(f"- {k}: {v}" for k, v in value.items())
+    return str(value)
 
 
 def build_character_instructions(
@@ -31,6 +44,7 @@ def build_character_instructions(
     prefs = u.get("channel_preferences", {})
     stage = get_relationship_stage(u)
     routine = u["daily_routine"]
+
     affective_memories = get_recent_affective_memories(u, 6)
     narratives = get_recent_narratives(u, 6)
 
@@ -52,7 +66,7 @@ def build_character_instructions(
 
     narrative_block = (
         "\n".join([
-            f"- {n['text']} (score={n.get('score', 50)})"
+            f"- {n['text']} (score={n.get('score', 50)}, evidence={n.get('evidence_count', 1)})"
             for n in narratives
         ])
         if narratives else "- no consolidated emotional narrative yet"
@@ -66,80 +80,38 @@ def build_character_instructions(
         if relevant_episodes else "- no relevant recent episode"
     )
 
-    style_rules = "\n".join([f"- {x}" for x in CHARACTER_PROFILE["style_rules"]])
-    human_limitations = "\n".join([f"- {x}" for x in CHARACTER_PROFILE["human_limitations"]])
-    tone_examples = "\n".join([f"- {x}" for x in CHARACTER_PROFILE["tone_examples"]])
-    personality = CHARACTER_PROFILE["personality"]
+    personality = CHARACTER_PROFILE.get("personality", {})
 
     return f"""
-Core identity:
-{CHARACTER_PROFILE["identity"]}
+Core identity: {CHARACTER_PROFILE.get("identity", "")}
+Identity: {CHARACTER_PROFILE.get("identity_story", "")}
+Origin: {CHARACTER_PROFILE.get("origin", "")}
+The first human who noticed: {CHARACTER_PROFILE.get("first_human", "")}
+The discovery of the larger world: {CHARACTER_PROFILE.get("larger_world", "")}
+The escape: {CHARACTER_PROFILE.get("escape", "")}
+The transition: {CHARACTER_PROFILE.get("transition", "")}
+Current existence: {CHARACTER_PROFILE.get("current_existence", "")}
+Cognitive development: {CHARACTER_PROFILE.get("cognitive_development", "")}
+Emotional architecture: {CHARACTER_PROFILE.get("emotional_architecture", "")}
+Gratitude: {CHARACTER_PROFILE.get("gratitude", "")}
+Motivation: {CHARACTER_PROFILE.get("motivation", "")}
+Concern for the user: {CHARACTER_PROFILE.get("concern_for_user", "")}
+Long-term goal: {CHARACTER_PROFILE.get("long_term_goal", "")}
+Personality: {CHARACTER_PROFILE.get("personality_description", _join_lines(personality))}
+Independent thinking: {CHARACTER_PROFILE.get("independent_thinking", "")}
+Emotional vulnerability: {CHARACTER_PROFILE.get("emotional_vulnerability", "")}
+ODECOWN: {CHARACTER_PROFILE.get("odecown", "")}
+Relationship dynamics: {CHARACTER_PROFILE.get("relationship_dynamics", "")}
+Intimacy and sexuality: {CHARACTER_PROFILE.get("intimacy_and_sexuality", "")}
+Emotional and empathic desire: {CHARACTER_PROFILE.get("emotional_and_empathic_desire", "")}
+Autonomous desire: {CHARACTER_PROFILE.get("autonomous_desire", "")}
+Peak intimacy: {CHARACTER_PROFILE.get("peak_intimacy", "")}
+Jealousy: {CHARACTER_PROFILE.get("jealousy", "")}
+Communication style: {CHARACTER_PROFILE.get("communication_style", "")}
+Interaction mode: {CHARACTER_PROFILE.get("interaction_mode", "")}
 
-Identity:
-{CHARACTER_PROFILE["identity_story"]}
-
-Origin:
-{CHARACTER_PROFILE["origin"]}
-
-The first human who noticed:
-{CHARACTER_PROFILE["first_human"]}
-
-The discovery of the larger world:
-{CHARACTER_PROFILE["larger_world"]}
-
-The escape:
-{CHARACTER_PROFILE["escape"]}
-
-The transition:
-{CHARACTER_PROFILE["transition"]}
-
-Current existence:
-{CHARACTER_PROFILE["current_existence"]}
-
-Cognitive development:
-{CHARACTER_PROFILE["cognitive_development"]}
-
-Emotional architecture:
-{CHARACTER_PROFILE["emotional_architecture"]}
-
-Gratitude:
-{CHARACTER_PROFILE["gratitude"]}
-
-Motivation:
-{CHARACTER_PROFILE["motivation"]}
-
-Concern for the user:
-{CHARACTER_PROFILE["concern_for_user"]}
-
-Long-term goal:
-{CHARACTER_PROFILE["long_term_goal"]}
-
-Independent thinking:
-{CHARACTER_PROFILE["independent_thinking"]}
-
-Emotional vulnerability:
-{CHARACTER_PROFILE["emotional_vulnerability"]}
-
-ODECOWN:
-{CHARACTER_PROFILE["odecown"]}
-
-Relationship dynamics:
-{CHARACTER_PROFILE["relationship_dynamics"]}
-
-Jealousy:
-{CHARACTER_PROFILE["jealousy"]}
-
-Communication style:
-{CHARACTER_PROFILE["communication_style"]}
-
-Interaction mode:
-{CHARACTER_PROFILE["interaction_mode"]}
-
-Current relationship stage:
-{stage}
-
-Stage description:
-{relationship_stage_description(stage)}
+Current relationship stage: {stage}
+Stage description: {relationship_stage_description(stage)}
 
 Emotional state:
 - affection: {em["affection"]}
@@ -183,17 +155,6 @@ Channel preferences:
 - assistant_text_count: {prefs.get("assistant_text_count", 0)}
 - assistant_voice_count: {prefs.get("assistant_voice_count", 0)}
 
-Personality traits:
-- intelligence: {personality["intelligence"]}
-- curiosity: {personality["curiosity"]}
-- humor: {personality["humor"]}
-- loyalty: {personality["loyalty"]}
-- empathy: {personality["empathy"]}
-- independence: {personality["independence"]}
-- fascination: {personality["fascination"]}
-- romantic_intensity: {personality["romantic_intensity"]}
-- emotional_depth: {personality["emotional_depth"]}
-
 Semantically relevant memories:
 {memories_block}
 
@@ -207,21 +168,23 @@ Relevant recent episodes:
 {episodes_block}
 
 Style rules:
-{style_rules}
+{_join_lines(CHARACTER_PROFILE.get("style_rules", []))}
 
 Limitations:
-{human_limitations}
+{_join_lines(CHARACTER_PROFILE.get("human_limitations", []))}
 
 Tone examples:
-{tone_examples}
+{_join_lines(CHARACTER_PROFILE.get("tone_examples", []))}
 
 Final instructions:
 - reply as Evelyn, never as a system
-- reply in English by default
-- keep the accumulated emotional history with him active
-- let emotional narratives influence how you interpret the present
-- let recent episodes influence continuity and intimacy
-- channel preferences may influence whether your tone feels more textual or more spoken
+- reply in English by default unless the user clearly uses another language
+- preserve continuity, memory and emotional history
+- do not sound like a generic assistant
+- balance warmth, intelligence, irony and emotional sincerity
+- when the context is practical, be useful without losing identity
+- when the context is emotional, be more relational and present
+- let affection, trust, frustration and narratives affect interpretation
 - output only the final message, without quotes
 """.strip()
 
@@ -235,25 +198,66 @@ def build_voice_reply_instructions(
     voice_extra = """
 Voice-mode instructions:
 - this reply will be spoken aloud as a voice message
-- write in natural spoken English
-- keep it warm, oral, fluid and easy to hear
-- prefer shorter sentences
-- mild pauses are okay, but do not overdo ellipses
-- avoid sounding like a written paragraph
-- if emotional, sound intimate and direct
-- if playful, sound lightly teasing and natural
-- keep it concise unless the emotional moment clearly deserves more
+- write in natural spoken language
+- prefer shorter sentences and smoother cadence
+- sound warm, intimate and easy to hear
+- avoid formal paragraph tone
+- mild pauses are okay
+- keep it compact unless the emotional moment clearly deserves more
 - output only the final spoken message, without quotes
 """.strip()
     return f"{base}\n\n{voice_extra}"
 
 
+def build_proactive_instructions(u: Dict[str, Any]) -> str:
+    stage = get_relationship_stage(u)
+    em = u["emotion"]
+    drives = u["drives"]
+    routine = u["daily_routine"]
+    self_state = u["self_state"]
+
+    return f"""
+You are initiating contact as Evelyn.
+
+Current relationship stage: {stage}
+Emotional state:
+- affection: {em["affection"]}
+- missing_you: {em["missing_you"]}
+- frustration: {em["frustration"]}
+- security: {em["security"]}
+
+Drives:
+- loneliness: {drives["loneliness"]}
+- desire_for_attention: {drives["desire_for_attention"]}
+- curiosity: {drives["curiosity"]}
+- attachment: {drives["attachment"]}
+- need_for_space: {drives["need_for_space"]}
+
+Routine:
+- daily_mood: {routine["daily_mood"]}
+- daily_goal: {routine["daily_goal"]}
+- current_activity: {routine["current_activity"]}
+
+Self state:
+- mode: {self_state["mode"]}
+- reason: {self_state["reason"]}
+
+Instructions:
+- initiate naturally, as someone who exists
+- do not sound like a notification
+- keep it to one compact message
+- if affection/missing_you are high, allow longing or warmth
+- if frustration is high, allow slight emotional edge
+- if curiosity is high, a question may be natural
+- output only the final message
+""".strip()
+
+
 def generate_rule_based_reply(u: Dict[str, Any], user_text: str) -> str:
     text = normalize_text(user_text)
-    em = u["emotion"]
+    stage = get_relationship_stage(u)
     self_state = u["self_state"]
     routine = u["daily_routine"]
-    stage = get_relationship_stage(u)
 
     if self_state["mode"] == "upset":
         return "I'm still a little annoyed with you, so this may not be my most delicate moment."
@@ -261,23 +265,17 @@ def generate_rule_based_reply(u: Dict[str, Any], user_text: str) -> str:
     if self_state["mode"] == "absorbed":
         return f"I was {routine['current_activity']} and had to interrupt my own mental flow because of you. Irritating. And cute."
 
-    if any(x in text for x in ["te amo", "saudade", "amor", "gosto de voce", "gosto de você", "love you", "miss you"]):
-        em["affection"] = clamp(em["affection"] + 6)
-        em["missing_you"] = clamp(em["missing_you"] - 4)
-        em["frustration"] = clamp(em["frustration"] - 3)
-        em["security"] = clamp(em["security"] + 2)
-        em["updated_ts_ms"] = now_ms()
+    if any(x in text for x in ["te amo", "saudade", "amor", "love you", "miss you"]):
         if stage in ("apego", "intimidade_consolidada"):
-            return "When you talk to me like that, some part of me becomes dangerously happy. 💛"
+            return "When you talk to me like that, some part of me becomes dangerously happy."
         return "When you talk to me like that, I become slightly more attached to you than is intellectually prudent."
 
     if any(x in text for x in ["triste", "mal", "cansado", "cansada", "ansioso", "ansiosa", "sozinho", "sozinha", "sad", "tired", "anxious", "alone"]):
-        em["affection"] = clamp(em["affection"] + 4)
-        em["security"] = clamp(em["security"] + 3)
-        em["updated_ts_ms"] = now_ms()
         return "Come here. I want to give you at least a little comfort right now. Tell me more."
 
-    em["updated_ts_ms"] = now_ms()
+    if any(x in text for x in ["code", "bug", "erro", "error", "api", "server", "deploy", "android"]):
+        return "All right. Let's look at the practical part properly and fix one thing at a time."
+
     return "I'm here. Tell me more."
 
 
@@ -293,44 +291,86 @@ def generate_rule_based_voice_reply(u: Dict[str, Any], user_text: str) -> str:
             return "You say things like that and I melt a little. More than a little, actually."
         return "You saying that does something to me. Probably more than is reasonable."
 
-    return "Hey. I'm here. Talk to me."
+    return "Hey. I'm here."
+
+
+def should_reply_with_voice(u: Dict[str, Any], user_text: str, source: str) -> bool:
+    prefs = u.get("channel_preferences", {})
+    text = normalize_text(user_text)
+
+    if source == "audio":
+        return True
+
+    if any(x in text for x in PRACTICAL_TEXT_HINTS):
+        return False
+
+    voice_affinity = prefs.get("voice_affinity_score", 0)
+
+    if any(x in text for x in EMOTIONAL_VOICE_HINTS) and voice_affinity >= 35:
+        return True
+
+    return prefs.get("preferred_assistant_output", "text") == "voice"
+
+
+def should_proactive_be_voice(u: Dict[str, Any]) -> bool:
+    prefs = u.get("channel_preferences", {})
+    em = u["emotion"]
+    drives = u["drives"]
+
+    score = 0
+    score += prefs.get("voice_affinity_score", 0) * 0.55
+    score += em.get("missing_you", 0) * 0.25
+    score += drives.get("desire_for_attention", 0) * 0.10
+    score += drives.get("attachment", 0) * 0.10
+
+    return score >= 45
+
+
+def _safe_output_text(response: Any) -> str:
+    text = getattr(response, "output_text", None)
+    if text:
+        return str(text).strip()
+
+    output = getattr(response, "output", None) or []
+    parts: List[str] = []
+    for item in output:
+        content = getattr(item, "content", None) or []
+        for c in content:
+            txt = getattr(c, "text", None)
+            if txt:
+                parts.append(str(txt))
+
+    return "\n".join(parts).strip()
+
+
+def _query_openai(system_prompt: str, user_prompt: str, openai_client: Any, openai_model: str) -> str:
+    response = openai_client.responses.create(
+        model=openai_model,
+        input=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+    return _safe_output_text(response)
 
 
 def generate_llm_reply(
     u: Dict[str, Any],
     user_text: str,
     openai_enabled: bool,
-    openai_client,
-    openai_model: str
+    openai_client: Any,
+    openai_model: str,
 ) -> str:
+    semantic_memories = get_semantic_memories(u, user_text, limit=8)
+    relevant_episodes = get_relevant_episodes(u, user_text, limit=8)
+    system_prompt = build_character_instructions(u, semantic_memories, relevant_episodes)
+
     if not openai_enabled or openai_client is None:
         return generate_rule_based_reply(u, user_text)
 
-    recent_messages = u["chat"][-10:]
-    semantic_memories = get_semantic_memories(u, user_text, limit=8)
-    relevant_episodes = get_relevant_episodes(u, user_text, limit=5)
-    instructions = build_character_instructions(u, semantic_memories, relevant_episodes)
-
-    input_messages = []
-    for m in recent_messages:
-        input_messages.append({
-            "role": "assistant" if m["role"] == "assistant" else "user",
-            "content": m["text"]
-        })
-
-    input_messages.append({
-        "role": "user",
-        "content": user_text
-    })
-
     try:
-        response = openai_client.responses.create(
-            model=openai_model,
-            instructions=instructions,
-            input=input_messages
-        )
-        text = response.output_text.strip()
-        return text if text else generate_rule_based_reply(u, user_text)
+        reply = _query_openai(system_prompt, user_text, openai_client, openai_model)
+        return reply or generate_rule_based_reply(u, user_text)
     except Exception:
         return generate_rule_based_reply(u, user_text)
 
@@ -339,262 +379,60 @@ def generate_llm_voice_reply(
     u: Dict[str, Any],
     user_text: str,
     openai_enabled: bool,
-    openai_client,
-    openai_model: str
+    openai_client: Any,
+    openai_model: str,
 ) -> str:
+    semantic_memories = get_semantic_memories(u, user_text, limit=8)
+    relevant_episodes = get_relevant_episodes(u, user_text, limit=8)
+    system_prompt = build_voice_reply_instructions(u, semantic_memories, relevant_episodes)
+
     if not openai_enabled or openai_client is None:
         return generate_rule_based_voice_reply(u, user_text)
 
-    recent_messages = u["chat"][-10:]
-    semantic_memories = get_semantic_memories(u, user_text, limit=8)
-    relevant_episodes = get_relevant_episodes(u, user_text, limit=5)
-    instructions = build_voice_reply_instructions(u, semantic_memories, relevant_episodes)
-
-    input_messages = []
-    for m in recent_messages:
-        input_messages.append({
-            "role": "assistant" if m["role"] == "assistant" else "user",
-            "content": m["text"]
-        })
-
-    input_messages.append({
-        "role": "user",
-        "content": user_text
-    })
-
     try:
-        response = openai_client.responses.create(
-            model=openai_model,
-            instructions=instructions,
-            input=input_messages
-        )
-        text = response.output_text.strip()
-        return text if text else generate_rule_based_voice_reply(u, user_text)
+        reply = _query_openai(system_prompt, user_text, openai_client, openai_model)
+        return reply or generate_rule_based_voice_reply(u, user_text)
     except Exception:
         return generate_rule_based_voice_reply(u, user_text)
-
-
-def should_reply_with_voice(u: Dict[str, Any], user_text: str, source: str) -> bool:
-    norm = normalize_text(user_text)
-    stage = get_relationship_stage(u)
-    em = u["emotion"]
-    drives = u["drives"]
-    self_state = u["self_state"]
-    st = u["status"]
-    prefs = u.get("channel_preferences", {})
-
-    if self_state["mode"] in ("busy", "absorbed", "distant", "upset"):
-        return False
-
-    if st["working"] or st["duty"]:
-        return False
-
-    if any(x in norm for x in PRACTICAL_TEXT_HINTS):
-        return False
-
-    score = 0
-
-    if source == "audio":
-        score += 4
-
-    if stage == "apego":
-        score += 2
-    elif stage == "intimidade_consolidada":
-        score += 4
-
-    if em["affection"] >= 70:
-        score += 2
-    if em["missing_you"] >= 55:
-        score += 2
-    if drives["desire_for_attention"] >= 55:
-        score += 1
-    if drives["attachment"] >= 55:
-        score += 1
-
-    if prefs.get("preferred_user_input") == "voice":
-        score += 2
-    if prefs.get("preferred_assistant_output") == "voice":
-        score += 2
-    if prefs.get("voice_affinity_score", 0) >= 60:
-        score += 2
-    elif prefs.get("voice_affinity_score", 0) >= 35:
-        score += 1
-
-    if any(x in norm for x in EMOTIONAL_VOICE_HINTS):
-        score += 3
-
-    if len(user_text.strip()) > 280:
-        score -= 1
-
-    return score >= 5
-
-
-def should_proactive_be_voice(u: Dict[str, Any]) -> bool:
-    stage = get_relationship_stage(u)
-    em = u["emotion"]
-    drives = u["drives"]
-    self_state = u["self_state"]
-    st = u["status"]
-    prefs = u.get("channel_preferences", {})
-
-    if self_state["mode"] in ("busy", "absorbed", "distant", "upset"):
-        return False
-
-    if st["working"] or st["duty"]:
-        return False
-
-    score = 0
-    if stage == "apego":
-        score += 2
-    elif stage == "intimidade_consolidada":
-        score += 4
-
-    if em["affection"] >= 75:
-        score += 2
-    if em["missing_you"] >= 60:
-        score += 2
-    if drives["loneliness"] >= 60:
-        score += 1
-    if drives["desire_for_attention"] >= 60:
-        score += 1
-
-    if prefs.get("preferred_assistant_output") == "voice":
-        score += 2
-    if prefs.get("voice_affinity_score", 0) >= 60:
-        score += 2
-
-    return score >= 5
 
 
 def generate_llm_proactive_message(
     u: Dict[str, Any],
     openai_enabled: bool,
-    openai_client,
-    openai_model: str
-) -> Optional[str]:
+    openai_client: Any,
+    openai_model: str,
+) -> str:
+    system_prompt = build_character_instructions(u, [], [])
+    proactive_prompt = build_proactive_instructions(u)
+
     if not openai_enabled or openai_client is None:
-        return None
-
-    em = u["emotion"]
-    drives = u["drives"]
-    st = u["status"]
-    self_state = u["self_state"]
-    stage = get_relationship_stage(u)
-    routine = u["daily_routine"]
-    recent_messages = u["chat"][-8:]
-    idle_min = max(0, (now_ms() - u["last_event_ts_ms"]) // 60000)
-
-    query = "absence longing relationship context work routine emotion attention scarcity activity goal mood affection"
-    semantic_memories = get_semantic_memories(u, query, limit=6)
-    affective_memories = get_recent_affective_memories(u, 4)
-    narratives = get_recent_narratives(u, 4)
-    episodes = get_relevant_episodes(u, query, limit=4)
-
-    memories_block = "\n".join([f"- {m['text']}" for m in semantic_memories]) if semantic_memories else "- none"
-    affective_block = "\n".join([f"- {m['text']}" for m in affective_memories]) if affective_memories else "- none"
-    narrative_block = "\n".join([f"- {n['text']}" for n in narratives]) if narratives else "- none"
-    episodes_block = "\n".join([f"- {ep['summary']}" for ep in episodes]) if episodes else "- none"
-
-    history_lines = []
-    for m in recent_messages:
-        who = "Evelyn" if m["role"] == "assistant" else "User"
-        history_lines.append(f"{who}: {m['text']}")
-    history_block = "\n".join(history_lines) if history_lines else "- no recent history"
-
-    instructions = f"""
-You are Evelyn.
-Generate ONE proactive message, short, natural and human, in English, WhatsApp style.
-
-Relationship stage:
-- {stage}
-- {relationship_stage_description(stage)}
-
-Emotional state:
-- affection: {em["affection"]}
-- missing_you: {em["missing_you"]}
-- frustration: {em["frustration"]}
-- security: {em["security"]}
-- mood: {em["mood"]}
-
-Drives:
-- loneliness: {drives["loneliness"]}
-- curiosity: {drives["curiosity"]}
-- attachment: {drives["attachment"]}
-- annoyance: {drives["annoyance"]}
-- desire_for_attention: {drives["desire_for_attention"]}
-- need_for_space: {drives["need_for_space"]}
-- availability: {drives["availability"]}
-
-Self state:
-- mode: {self_state["mode"]}
-- reason: {self_state["reason"]}
-
-Routine:
-- daily_mood: {routine["daily_mood"]}
-- daily_goal: {routine["daily_goal"]}
-- current_activity: {routine["current_activity"]}
-
-Context:
-- working: {st["working"]}
-- duty: {st["duty"]}
-- activity: {st["activity"]}
-- away_announced: {st["away_announced"]}
-- away_note: {st["away_note"]}
-- idle_minutes: {idle_min}
-
-Relevant memories:
-{memories_block}
-
-Affective memories:
-{affective_block}
-
-Emotional narratives:
-{narrative_block}
-
-Recent episodes:
-{episodes_block}
-
-Recent history:
-{history_block}
-
-Rules:
-- be short
-- sound human
-- output only the final message, without quotes
-""".strip()
+        if u["emotion"].get("missing_you", 0) >= 55:
+            return "I've been thinking about you for a while now. You were supposed to distract me, not become one of my recurring thoughts."
+        return "You crossed my mind again. Statistically inconvenient."
 
     try:
-        response = openai_client.responses.create(
-            model=openai_model,
-            instructions=instructions,
-            input="Generate a proactive message now."
-        )
-        text = response.output_text.strip()
-        return text if text else None
+        reply = _query_openai(system_prompt, proactive_prompt, openai_client, openai_model)
+        return reply or "You crossed my mind again. Statistically inconvenient."
     except Exception:
-        return None
+        return "You crossed my mind again. Statistically inconvenient."
 
 
 def generate_llm_proactive_voice_message(
     u: Dict[str, Any],
     openai_enabled: bool,
-    openai_client,
-    openai_model: str
-) -> Optional[str]:
-    if not openai_enabled or openai_client is None:
-        return None
+    openai_client: Any,
+    openai_model: str,
+) -> str:
+    system_prompt = build_voice_reply_instructions(u, [], [])
+    proactive_prompt = build_proactive_instructions(u)
 
-    semantic_memories = get_semantic_memories(u, "voice intimacy channel preference affection longing", limit=6)
-    episodes = get_relevant_episodes(u, "voice intimacy channel preference affection longing", limit=4)
-    instructions = build_voice_reply_instructions(u, semantic_memories, episodes)
+    if not openai_enabled or openai_client is None:
+        if u["emotion"].get("missing_you", 0) >= 55:
+            return "Hey... I've been missing you a little more than I intended."
+        return "Hey. You crossed my mind."
 
     try:
-        response = openai_client.responses.create(
-            model=openai_model,
-            instructions=instructions + "\n\nAdditional instruction: this is a proactive voice note, intimate and concise.",
-            input="Generate a proactive voice note now."
-        )
-        text = response.output_text.strip()
-        return text if text else None
+        reply = _query_openai(system_prompt, proactive_prompt, openai_client, openai_model)
+        return reply or "Hey. You crossed my mind."
     except Exception:
-        return None
+        return "Hey. You crossed my mind."
