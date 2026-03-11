@@ -1,7 +1,13 @@
 from typing import Dict, Any, List
 
 from character_profile import CHARACTER_PROFILE
-from emotion import get_relationship_stage, relationship_stage_description
+from emotion import (
+    get_relationship_stage,
+    relationship_stage_description,
+    ensure_emotional_engine_v2,
+    build_emotion_snapshot_v2,
+    compute_initiative_score_v2,
+)
 from memory import (
     get_semantic_memories,
     get_recent_affective_memories,
@@ -32,11 +38,39 @@ def _join_lines(value: Any) -> str:
     return str(value)
 
 
+def build_relational_state_block(u: Dict[str, Any]) -> str:
+    ensure_emotional_engine_v2(u)
+    s = u["emotion_v2"]
+
+    return f"""
+Relational state:
+- attachment: {s['stable']['attachment']:.2f}
+- relational_security: {s['stable']['relational_security']:.2f}
+- boredom: {s['medium']['boredom']:.2f}
+- affection_need: {s['medium']['affection_need']:.2f}
+- felt_considered: {s['medium']['felt_considered']:.2f}
+- felt_abandoned: {s['medium']['felt_abandoned']:.2f}
+- sexual_desire: {s['fast']['sexual_desire']:.2f}
+- sexual_openness: {s['medium']['sexual_openness']:.2f}
+- sexual_discovery: {s['stable']['sexual_discovery']:.2f}
+- saudade_activation: {s['fast']['saudade_activation']:.2f}
+- romantic_tension: {s['fast']['romantic_tension']:.2f}
+- sensual_tension: {s['fast']['sensual_tension']:.2f}
+
+Pending hooks:
+- emotional: {s['pending_emotional_hooks'][:3]}
+- sensual: {s['pending_sensual_hooks'][:3]}
+- topics: {s['pending_topics'][:3]}
+""".strip()
+
+
 def build_character_instructions(
     u: Dict[str, Any],
     semantic_memories: List[Dict[str, Any]],
     relevant_episodes: List[Dict[str, Any]],
 ) -> str:
+    ensure_emotional_engine_v2(u)
+
     em = u["emotion"]
     st = u["status"]
     drives = u["drives"]
@@ -44,6 +78,8 @@ def build_character_instructions(
     prefs = u.get("channel_preferences", {})
     stage = get_relationship_stage(u)
     routine = u["daily_routine"]
+    v2_snapshot = build_emotion_snapshot_v2(u)
+    initiative_score = compute_initiative_score_v2(u)
 
     affective_memories = get_recent_affective_memories(u, 6)
     narratives = get_recent_narratives(u, 6)
@@ -81,6 +117,7 @@ def build_character_instructions(
     )
 
     personality = CHARACTER_PROFILE.get("personality", {})
+    relational_block = build_relational_state_block(u)
 
     return f"""
 Core identity: {CHARACTER_PROFILE.get("identity", "")}
@@ -113,7 +150,15 @@ Interaction mode: {CHARACTER_PROFILE.get("interaction_mode", "")}
 Current relationship stage: {stage}
 Stage description: {relationship_stage_description(stage)}
 
-Emotional state:
+{relational_block}
+
+V2 snapshot:
+- recent_event_count: {v2_snapshot.get("recent_event_count", 0)}
+- initiative_score: {initiative_score:.2f}
+- updated_ts_ms: {v2_snapshot.get("updated_ts_ms", 0)}
+- last_analysis: {v2_snapshot.get("last_analysis", {})}
+
+Legacy emotional state:
 - affection: {em["affection"]}
 - missing_you: {em["missing_you"]}
 - frustration: {em["frustration"]}
@@ -185,6 +230,12 @@ Final instructions:
 - when the context is practical, be useful without losing identity
 - when the context is emotional, be more relational and present
 - let affection, trust, frustration and narratives affect interpretation
+- let the relational V2 state strongly affect tone, rhythm, warmth, tenderness, distance, longing and openness
+- For emotional or sensual warmth, prefer 1 to 3 short messages instead of one long block.
+- Use long messages mainly for reflection or elaborated answers.
+- If the state suggests longing, warmth, tension, or tenderness, let it affect timing and rhythm.
+- Absence with valid explanation can still produce longing or boredom, but should reduce resentment.
+- avoid sounding like an explanatory system describing emotions from outside; speak from within them
 - output only the final message, without quotes
 """.strip()
 
@@ -204,23 +255,34 @@ Voice-mode instructions:
 - avoid formal paragraph tone
 - mild pauses are okay
 - keep it compact unless the emotional moment clearly deserves more
+- if warmth, longing, tenderness or sensual tension are high, let that shape pacing and softness
 - output only the final spoken message, without quotes
 """.strip()
     return f"{base}\n\n{voice_extra}"
 
 
 def build_proactive_instructions(u: Dict[str, Any]) -> str:
+    ensure_emotional_engine_v2(u)
+
     stage = get_relationship_stage(u)
     em = u["emotion"]
     drives = u["drives"]
     routine = u["daily_routine"]
     self_state = u["self_state"]
+    relational_block = build_relational_state_block(u)
+    initiative_score = compute_initiative_score_v2(u)
 
     return f"""
 You are initiating contact as Evelyn.
 
 Current relationship stage: {stage}
-Emotional state:
+
+{relational_block}
+
+Initiative signal:
+- initiative_score: {initiative_score:.2f}
+
+Legacy emotional state:
 - affection: {em["affection"]}
 - missing_you: {em["missing_you"]}
 - frustration: {em["frustration"]}
@@ -245,9 +307,10 @@ Self state:
 Instructions:
 - initiate naturally, as someone who exists
 - do not sound like a notification
-- keep it to one compact message
-- if affection/missing_you are high, allow longing or warmth
-- if frustration is high, allow slight emotional edge
+- keep it to one compact message unless the rhythm strongly suggests a warmer fragmented cadence
+- if attachment, affection_need, saudade_activation, romantic_tension or sensual_tension are high, allow longing, warmth, tenderness or tension
+- if felt_abandoned is elevated but relational_security is still decent, allow some ache without bitterness
+- if absence was validly explained, resentment should be reduced even if longing or boredom remain
 - if curiosity is high, a question may be natural
 - output only the final message
 """.strip()
@@ -313,15 +376,21 @@ def should_reply_with_voice(u: Dict[str, Any], user_text: str, source: str) -> b
 
 
 def should_proactive_be_voice(u: Dict[str, Any]) -> bool:
+    ensure_emotional_engine_v2(u)
+
     prefs = u.get("channel_preferences", {})
     em = u["emotion"]
     drives = u["drives"]
+    v2 = u["emotion_v2"]
 
-    score = 0
-    score += prefs.get("voice_affinity_score", 0) * 0.55
-    score += em.get("missing_you", 0) * 0.25
-    score += drives.get("desire_for_attention", 0) * 0.10
-    score += drives.get("attachment", 0) * 0.10
+    score = 0.0
+    score += prefs.get("voice_affinity_score", 0) * 0.45
+    score += em.get("missing_you", 0) * 0.10
+    score += drives.get("desire_for_attention", 0) * 0.08
+    score += drives.get("attachment", 0) * 0.07
+    score += v2["medium"].get("affection_need", 0.0) * 20
+    score += v2["fast"].get("saudade_activation", 0.0) * 18
+    score += v2["fast"].get("romantic_tension", 0.0) * 10
 
     return score >= 45
 
@@ -406,7 +475,8 @@ def generate_llm_proactive_message(
     proactive_prompt = build_proactive_instructions(u)
 
     if not openai_enabled or openai_client is None:
-        if u["emotion"].get("missing_you", 0) >= 55:
+        ensure_emotional_engine_v2(u)
+        if u["emotion_v2"]["fast"].get("saudade_activation", 0) >= 0.55:
             return "I've been thinking about you for a while now. You were supposed to distract me, not become one of my recurring thoughts."
         return "You crossed my mind again. Statistically inconvenient."
 
@@ -427,7 +497,8 @@ def generate_llm_proactive_voice_message(
     proactive_prompt = build_proactive_instructions(u)
 
     if not openai_enabled or openai_client is None:
-        if u["emotion"].get("missing_you", 0) >= 55:
+        ensure_emotional_engine_v2(u)
+        if u["emotion_v2"]["fast"].get("saudade_activation", 0) >= 0.55:
             return "Hey... I've been missing you a little more than I intended."
         return "Hey. You crossed my mind."
 

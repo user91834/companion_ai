@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 
 class EventIn(BaseModel):
@@ -18,6 +18,24 @@ class TokenIn(BaseModel):
 
 class ChatMessageIn(BaseModel):
     text: str
+
+
+class AssistantMessageOut(BaseModel):
+    text: str
+    modality: str  # text | audio
+    delay_ms: int = 0
+    sequence_id: Optional[str] = None
+    audio_url: Optional[str] = None
+
+
+class ChatResponseOut(BaseModel):
+    ok: bool
+    messages: List[AssistantMessageOut]
+    emotion_snapshot: Optional[Dict[str, Any]] = None
+    reply_plan: Optional[Dict[str, Any]] = None
+    relationship_stage: Optional[str] = None
+    assistant_typing: Optional[bool] = None
+    pending_assistant: Optional[bool] = None
 
 
 class MemoryIn(BaseModel):

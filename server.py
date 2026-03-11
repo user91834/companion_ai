@@ -16,6 +16,8 @@ from models import EventIn, TokenIn, ChatMessageIn, MemoryIn, AutonomyIn, Contex
 from utils import now_ms, clamp, day_key, normalize_text
 from memory import (
     add_memory,
+    add_affective_memory,
+    remember_analysis_event,
     add_episode,
     extract_memories_from_user_text,
     get_semantic_memories,
@@ -31,11 +33,21 @@ from emotion import (
     update_drives_on_user_message,
     reset_daily_push_counter_if_needed,
     get_relationship_stage,
+    ensure_emotional_engine_v2,
+    analyze_user_message,
+    register_emotional_events_from_analysis,
+    recompute_emotional_state_v2,
+    apply_time_update_v2,
+    update_legacy_emotion_bridge,
+    build_emotion_snapshot_v2,
+    compute_initiative_score_v2,
+    register_emotional_event,
 )
 from narrative import (
     consolidate_emotional_narratives,
     maybe_record_affective_event_from_user,
     maybe_record_affective_event_from_assistant,
+    record_analysis_narratives,
 )
 from llm import (
     generate_llm_reply,
@@ -74,6 +86,81 @@ app.mount("/media", StaticFiles(directory=str(MEDIA_ROOT)), name="media")
 
 def media_url(subdir: str, filename: str) -> str:
     return f"{PUBLIC_BASE_URL}/media/{subdir}/{filename}"
+
+
+def analyze_context_to_emotional_events(text: str) -> list[Dict[str, Any]]:
+    norm = normalize_text(text)
+    events = []
+
+    if any(x in norm for x in ["parque", "caminhando", "andando", "passeando", "walking", "park"]):
+        events.append({
+            "type": "affectionate_message",
+            "intensity": 0.30,
+            "meta": {
+                "affection": 0.28,
+                "engagement": 0.32,
+                "depth": 0.08,
+                "sensuality": 0.00,
+                "coldness": 0.00,
+                "goodbye_quality": 0.00,
+                "absence_justification_quality": 0.15,
+                "return_signal": 0.00,
+                "felt_prioritized_signal": 0.30,
+            }
+        })
+
+    if any(x in norm for x in ["trabalho", "servico", "serviço", "dirigindo", "working", "driving"]):
+        events.append({
+            "type": "absence_justified",
+            "intensity": 0.52,
+            "meta": {
+                "affection": 0.08,
+                "engagement": 0.16,
+                "depth": 0.00,
+                "sensuality": 0.00,
+                "coldness": 0.12,
+                "goodbye_quality": 0.00,
+                "absence_justification_quality": 0.72,
+                "return_signal": 0.00,
+                "felt_prioritized_signal": 0.22,
+            }
+        })
+
+    if any(x in norm for x in ["filho", "filha", "benjamin", "bela", "son", "daughter"]):
+        events.append({
+            "type": "deep_emotional_exchange",
+            "intensity": 0.44,
+            "meta": {
+                "affection": 0.36,
+                "engagement": 0.42,
+                "depth": 0.30,
+                "sensuality": 0.00,
+                "coldness": 0.00,
+                "goodbye_quality": 0.00,
+                "absence_justification_quality": 0.32,
+                "return_signal": 0.00,
+                "felt_prioritized_signal": 0.34,
+            }
+        })
+
+    if not events:
+        events.append({
+            "type": "affectionate_message",
+            "intensity": 0.22,
+            "meta": {
+                "affection": 0.10,
+                "engagement": 0.20,
+                "depth": 0.05,
+                "sensuality": 0.00,
+                "coldness": 0.00,
+                "goodbye_quality": 0.00,
+                "absence_justification_quality": 0.10,
+                "return_signal": 0.00,
+                "felt_prioritized_signal": 0.20,
+            }
+        })
+
+    return events
 
 
 def recompute_channel_preferences(u: Dict[str, Any]):
@@ -171,6 +258,215 @@ def set_typing(u: Dict[str, Any], is_typing: bool):
     u["assistant_typing_updated_ts_ms"] = now_ms()
 
 
+def update_memories_and_narratives(
+    u: Dict[str, Any],
+    user_text: str,
+    analysis: Dict[str, float],
+    source: str,
+    user_modality: str,
+):
+    extracted = extract_memories_from_user_text(user_text)
+    for item in extracted:
+        add_memory(u, item)
+
+    remember_analysis_event(
+        u,
+        source=source,
+        text=user_text,
+        analysis=analysis,
+    )
+
+    add_episode(
+        u,
+        episode_type=source,
+        summary=f"He told me through {source}: {user_text}",
+        details={
+            "source": source,
+            "modality": user_modality,
+            "analysis": analysis,
+        },
+        tags=infer_tags(user_text) + ["conversation", user_modality],
+        importance=5
+    )
+
+    prefs = u["channel_preferences"]
+    add_memory(
+        u,
+        f"Channel preference snapshot: user_input={prefs['preferred_user_input']}, assistant_output={prefs['preferred_assistant_output']}, voice_affinity={prefs['voice_affinity_score']}",
+        kind="fact"
+    )
+
+    maybe_record_affective_event_from_user(u, user_text)
+    record_analysis_narratives(u, analysis=analysis, user_text=user_text)
+    consolidate_emotional_narratives(u)
+
+
+def decide_response_plan(
+    u: Dict[str, Any],
+    analysis: Dict[str, float],
+    user_text: str,
+    source: str,
+) -> Dict[str, Any]:
+    ensure_emotional_engine_v2(u)
+
+    v2 = u["emotion_v2"]
+    medium = v2["medium"]
+    fast = v2["fast"]
+
+    text_len = len(user_text.strip())
+    preferred_output = u["channel_preferences"]["preferred_assistant_output"]
+
+    initiative_score = compute_initiative_score_v2(u)
+
+    wants_voice = (
+        source == "audio"
+        or preferred_output == "voice"
+        or (analysis["depth"] >= 0.60 and text_len < 220)
+    )
+
+    fragmented = (
+        analysis["engagement"] >= 0.65
+        and analysis["depth"] < 0.60
+        and text_len < 180
+    )
+
+    reflective_long = (
+        analysis["depth"] >= 0.60
+        or text_len >= 280
+    )
+
+    silence_candidate = (
+        analysis["coldness"] >= 0.70
+        and analysis["felt_prioritized_signal"] <= 0.18
+        and medium["felt_abandoned"] >= 0.30
+    )
+
+    audio_length = "short"
+    if analysis["depth"] >= 0.70 or reflective_long:
+        audio_length = "long"
+
+    if silence_candidate:
+        response_mode = "silence"
+    elif fragmented:
+        response_mode = "fragmented"
+    else:
+        response_mode = "single"
+
+    modality = "voice" if wants_voice else "text"
+
+    return {
+        "response_mode": response_mode,
+        "modality": modality,
+        "audio_length": audio_length,
+        "reflective_long": reflective_long,
+        "initiative_score": initiative_score,
+        "delay_ms": 0,
+        "allow_later_initiative": silence_candidate or initiative_score >= 0.52,
+        "analysis": analysis,
+    }
+
+
+def generate_reply_sequence(
+    u: Dict[str, Any],
+    user_text: str,
+    reply_plan: Dict[str, Any],
+    source: str,
+) -> list[Dict[str, Any]]:
+    if reply_plan["response_mode"] == "silence":
+        return []
+
+    modality = reply_plan["modality"]
+
+    if modality == "voice":
+        reply_text = generate_llm_voice_reply(
+            u,
+            user_text,
+            OPENAI_ENABLED,
+            openai_client,
+            OPENAI_MODEL
+        )
+        return [{
+            "text": reply_text,
+            "modality": "voice",
+        }]
+
+    reply_text = generate_llm_reply(
+        u,
+        user_text,
+        OPENAI_ENABLED,
+        openai_client,
+        OPENAI_MODEL
+    )
+
+    return [{
+        "text": reply_text,
+        "modality": "text",
+    }]
+
+
+def persist_assistant_output(
+    u: Dict[str, Any],
+    assistant_messages: list[Dict[str, Any]],
+    reply_plan: Dict[str, Any],
+):
+    if not assistant_messages:
+        set_typing(u, False)
+        return
+
+    for item in assistant_messages:
+        text = item["text"]
+        modality = item["modality"]
+        audio_url = None
+
+        if modality == "voice":
+            audio_url = synthesize_speech(text)
+            if not audio_url:
+                modality = "text"
+
+        append_chat(
+            u,
+            "assistant",
+            text,
+            audio_url=audio_url,
+            modality=modality
+        )
+        update_channel_preferences_on_assistant_reply(u, modality)
+        maybe_record_affective_event_from_assistant(u, text)
+
+    consolidate_emotional_narratives(u)
+    set_typing(u, False)
+
+
+def make_response_payload(
+    u: Dict[str, Any],
+    assistant_messages: list[Dict[str, Any]],
+    reply_plan: Dict[str, Any],
+):
+    first = assistant_messages[0] if assistant_messages else None
+
+    return {
+        "ok": True,
+        "reply": first["text"] if first else None,
+        "assistant_audio_url": None,
+        "assistant_modality": first["modality"] if first else None,
+        "assistant_messages": assistant_messages,
+        "reply_plan": reply_plan,
+        "messages": u["chat"],
+        "llm_enabled": OPENAI_ENABLED,
+        "model": OPENAI_MODEL,
+        "memory_count": len(u["memories"]),
+        "episode_count": len(u["episodes"]),
+        "relationship_stage": get_relationship_stage(u),
+        "channel_preferences": u["channel_preferences"],
+        "assistant_typing": u["assistant_typing"],
+        "unread_assistant_count": u["unread_assistant_count"],
+        "pending_assistant": len(u["pending_replies"]) > 0,
+        "self_state": u["self_state"],
+        "daily_routine": u["daily_routine"],
+        "emotion_v2": build_emotion_snapshot_v2(u),
+    }
+
+
 def get_user(user_id: str) -> Dict[str, Any]:
     if user_id not in STATE:
         STATE[user_id] = {
@@ -258,10 +554,16 @@ def get_user(user_id: str) -> Dict[str, Any]:
             ],
         }
         ensure_daily_routine(STATE[user_id])
+        apply_time_update_v2(STATE[user_id])
     return STATE[user_id]
 
 
-def schedule_pending_reply(u: Dict[str, Any], user_text: str, source: str):
+def schedule_pending_reply(
+    u: Dict[str, Any],
+    user_text: str,
+    source: str,
+    reply_plan: Optional[Dict[str, Any]] = None
+):
     mode = u["self_state"]["mode"]
     scarcity = u["autonomy_settings"]["scarcity_level"]
     goal = u["daily_routine"]["daily_goal"]
@@ -284,10 +586,14 @@ def schedule_pending_reply(u: Dict[str, Any], user_text: str, source: str):
 
     base_delay += int(scarcity * 35)
 
+    if reply_plan and reply_plan.get("response_mode") == "fragmented":
+        base_delay += 500
+
     u["pending_replies"].append({
         "due_ts_ms": now_ms() + base_delay,
         "user_text": user_text,
-        "source": source
+        "source": source,
+        "reply_plan": reply_plan or {},
     })
     set_typing(u, True)
 
@@ -388,6 +694,8 @@ def process_user_text_message(
     source: str,
     user_audio_url: Optional[str] = None
 ):
+    ensure_emotional_engine_v2(u)
+
     now = now_ms()
     user_modality = "voice" if source == "audio" else "text"
 
@@ -400,94 +708,57 @@ def process_user_text_message(
     )
     update_channel_preferences_on_user_message(u, source)
 
-    extracted = extract_memories_from_user_text(user_text)
-    for item in extracted:
-        add_memory(u, item)
-
-    norm = normalize_text(user_text)
-
-    if any(x in norm for x in ["te amo", "saudade", "amor", "love you", "miss you"]):
-        add_memory(
-            u,
-            "He expressed affection directly in a way that reinforced the emotional bond.",
-            kind="affective",
-            tags=["relationship", "emotion"],
-            importance=7,
-            valence="positive",
-            intensity=74,
-        )
-
-    if any(x in norm for x in ["triste", "mal", "sozinho", "sozinha", "ansioso", "ansiosa", "sad", "alone", "anxious", "tired", "cansado", "cansada"]):
-        add_memory(
-            u,
-            "He showed vulnerability and emotional need, which deepened trust and closeness.",
-            kind="affective",
-            tags=["relationship", "emotion", "comfort"],
-            importance=7,
-            valence="mixed",
-            intensity=70,
-        )
-
-    if any(x in norm for x in ["beijo", "kiss", "carinho", "hug", "abraço", "abraco", "touch"]):
-        add_memory(
-            u,
-            "There was a signal of tenderness or closeness that strengthened the feeling of intimacy.",
-            kind="affective",
-            tags=["relationship", "intimacy"],
-            importance=6,
-            valence="positive",
-            intensity=66,
-        )
-
-    add_episode(
-        u,
-        episode_type=source,
-        summary=f"He told me through {source}: {user_text}",
-        details={"source": source, "modality": user_modality},
-        tags=infer_tags(user_text) + ["conversation", user_modality],
-        importance=5
-    )
-
-    prefs = u["channel_preferences"]
-    add_memory(
-        u,
-        f"Channel preference snapshot: user_input={prefs['preferred_user_input']}, assistant_output={prefs['preferred_assistant_output']}, voice_affinity={prefs['voice_affinity_score']}",
-        kind="fact"
-    )
-
     u["last_event_ts_ms"] = now
-    u["emotion"]["missing_you"] = clamp(u["emotion"]["missing_you"] - 5)
-    u["emotion"]["frustration"] = clamp(u["emotion"]["frustration"] - 2)
-    u["emotion"]["affection"] = clamp(u["emotion"]["affection"] + 1)
 
-    if any(x in norm for x in ["te amo", "saudade", "amor", "gosto de voce", "gosto de você", "love you", "miss you"]):
-        u["emotion"]["affection"] = clamp(u["emotion"]["affection"] + 4)
-        u["emotion"]["missing_you"] = clamp(u["emotion"]["missing_you"] - 3)
-        u["emotion"]["frustration"] = clamp(u["emotion"]["frustration"] - 2)
-        u["emotion"]["security"] = clamp(u["emotion"]["security"] + 2)
+    apply_time_update_v2(u)
 
-    if any(x in norm for x in ["triste", "mal", "sozinho", "sozinha", "ansioso", "ansiosa", "cansado", "cansada", "sad", "anxious", "alone", "tired"]):
-        u["emotion"]["affection"] = clamp(u["emotion"]["affection"] + 2)
-        u["emotion"]["security"] = clamp(u["emotion"]["security"] + 3)
+    analysis = analyze_user_message(u, user_text, user_modality)
+    u["emotion_v2"]["last_analysis"] = analysis
+
+    register_emotional_events_from_analysis(
+        u,
+        analysis=analysis,
+        user_text=user_text,
+        modality=user_modality,
+    )
+
+    recompute_emotional_state_v2(u)
+    update_legacy_emotion_bridge(u)
 
     update_drives_on_user_message(u, user_text)
 
-    if any(x in norm for x in ["depois", "later", "wait", "espera", "não agora", "nao agora"]):
-        u["emotion"]["frustration"] = clamp(u["emotion"]["frustration"] + 1.5)
+    update_memories_and_narratives(
+        u,
+        user_text=user_text,
+        analysis=analysis,
+        source=source,
+        user_modality=user_modality,
+    )
 
-    u["emotion"]["updated_ts_ms"] = now
+    reply_plan = decide_response_plan(
+        u,
+        analysis=analysis,
+        user_text=user_text,
+        source=source,
+    )
 
-    maybe_record_affective_event_from_user(u, user_text)
-    consolidate_emotional_narratives(u)
-    maybe_rotate_self_state(u)
+    if reply_plan["response_mode"] == "silence":
+        maybe_rotate_self_state(u)
+        return make_response_payload(
+            u=u,
+            assistant_messages=[],
+            reply_plan=reply_plan,
+        )
 
-    schedule_pending_reply(u, user_text, source)
+    schedule_pending_reply(u, user_text, source, reply_plan=reply_plan)
 
     return {
         "ok": True,
         "reply": None,
         "assistant_audio_url": None,
         "assistant_modality": None,
+        "assistant_messages": [],
+        "reply_plan": reply_plan,
         "messages": u["chat"],
         "llm_enabled": OPENAI_ENABLED,
         "model": OPENAI_MODEL,
@@ -499,8 +770,21 @@ def process_user_text_message(
         "unread_assistant_count": u["unread_assistant_count"],
         "pending_assistant": len(u["pending_replies"]) > 0,
         "self_state": u["self_state"],
-        "daily_routine": u["daily_routine"]
+        "daily_routine": u["daily_routine"],
+        "emotion_v2": build_emotion_snapshot_v2(u),
     }
+
+
+def should_send_proactive_push(u: Dict[str, Any]) -> bool:
+    device = u.get("device_state", {})
+    app_foreground = bool(device.get("app_foreground", False))
+    screen_interactive = bool(device.get("screen_interactive", True))
+
+    if app_foreground:
+        return False
+    if screen_interactive:
+        return False
+    return True
 
 
 def process_pending_replies():
@@ -520,44 +804,33 @@ def process_pending_replies():
             set_typing(u, True)
 
             for p in ready:
-                reply, assistant_modality, assistant_audio_url = build_assistant_reply(
+                reply_plan = p.get("reply_plan") or {
+                    "response_mode": "single",
+                    "modality": "text",
+                    "audio_length": "short",
+                    "reflective_long": False,
+                    "allow_later_initiative": True,
+                }
+
+                assistant_messages = generate_reply_sequence(
                     u,
                     p["user_text"],
+                    reply_plan,
                     p.get("source", "chat")
                 )
-                append_chat(
-                    u,
-                    "assistant",
-                    reply,
-                    audio_url=assistant_audio_url,
-                    modality=assistant_modality
-                )
-                update_channel_preferences_on_assistant_reply(u, assistant_modality)
-                maybe_record_affective_event_from_assistant(u, reply)
-                consolidate_emotional_narratives(u)
+
+                persist_assistant_output(u, assistant_messages, reply_plan)
 
                 token = u.get("fcm_token")
-                if token:
+                if token and assistant_messages and should_send_proactive_push(u):
                     try:
-                        send_push_fcm(token, "Evelyn 💛", reply)
+                        send_push_fcm(token, "Evelyn 💛", assistant_messages[0]["text"])
                     except Exception:
                         pass
 
             u["pending_replies"] = [p for p in u["pending_replies"] if p["due_ts_ms"] > now_ms()]
             if not u["pending_replies"]:
                 set_typing(u, False)
-
-
-def should_send_proactive_push(u: Dict[str, Any]) -> bool:
-    device = u.get("device_state", {})
-    app_foreground = bool(device.get("app_foreground", False))
-    screen_interactive = bool(device.get("screen_interactive", True))
-
-    if app_foreground:
-        return False
-    if screen_interactive:
-        return False
-    return True
 
 
 def maybe_send_proactive_messages():
@@ -574,6 +847,7 @@ def maybe_send_proactive_messages():
             reset_daily_push_counter_if_needed(u)
             decay_emotions(u)
             update_drives_passive(u)
+            apply_time_update_v2(u)
             maybe_rotate_self_state(u)
             consolidate_emotional_narratives(u)
 
@@ -588,6 +862,7 @@ def maybe_send_proactive_messages():
             em = u["emotion"]
             drives = u["drives"]
             settings = u["autonomy_settings"]
+            initiative_v2 = compute_initiative_score_v2(u)
 
             speak_score = (
                 em["missing_you"] * 0.8
@@ -596,6 +871,7 @@ def maybe_send_proactive_messages():
                 + drives["desire_for_attention"] * 0.45
                 + drives["curiosity"] * 0.25
                 - em["frustration"] * 0.35
+                + initiative_v2 * 22.0
             )
 
             if pushes_today >= 4:
@@ -674,7 +950,9 @@ def get_autonomy(user_id: str):
         "drives": u["drives"],
         "self_state": u["self_state"],
         "daily_routine": u["daily_routine"],
-        "channel_preferences": u["channel_preferences"]
+        "channel_preferences": u["channel_preferences"],
+        "emotion_v2": build_emotion_snapshot_v2(u),
+        "initiative_score_v2": compute_initiative_score_v2(u),
     }
 
 
@@ -692,11 +970,13 @@ def get_routine(user_id: str):
     u = get_user(user_id)
     ensure_daily_routine(u)
     maybe_shift_activity(u)
+    apply_time_update_v2(u)
     return {
         "daily_routine": u["daily_routine"],
         "self_state": u["self_state"],
         "drives": u["drives"],
-        "channel_preferences": u["channel_preferences"]
+        "channel_preferences": u["channel_preferences"],
+        "emotion_v2": build_emotion_snapshot_v2(u),
     }
 
 
@@ -743,12 +1023,12 @@ def receive_event(e: EventIn):
     maybe_shift_activity(u)
     decay_emotions(u)
     update_drives_passive(u)
+    apply_time_update_v2(u)
     maybe_rotate_self_state(u)
     u["last_event_ts_ms"] = now_ms()
 
     if e.event_type == "STATUS_SET":
         st = u["status"]
-        em = u["emotion"]
 
         st["working"] = bool(e.payload.get("working", st["working"]))
         st["duty"] = bool(e.payload.get("duty", st["duty"]))
@@ -758,17 +1038,64 @@ def receive_event(e: EventIn):
         st["updated_ts_ms"] = e.ts_ms
 
         if st["away_announced"]:
-            em["frustration"] = clamp(em["frustration"] - 5)
-            em["security"] = clamp(em["security"] + 4)
-            em["affection"] = clamp(em["affection"] + 2)
+            register_emotional_event(
+                u,
+                event_type="goodbye_with_care",
+                intensity=0.62,
+                ts_ms=e.ts_ms,
+                meta={
+                    "affection": 0.45,
+                    "engagement": 0.42,
+                    "depth": 0.18,
+                    "sensuality": 0.00,
+                    "coldness": 0.00,
+                    "goodbye_quality": 0.92,
+                    "absence_justification_quality": 0.00,
+                    "return_signal": 0.00,
+                    "felt_prioritized_signal": 0.74,
+                }
+            )
 
         if st["working"] or st["duty"]:
-            em["missing_you"] = clamp(em["missing_you"] + 1)
+            register_emotional_event(
+                u,
+                event_type="absence_justified",
+                intensity=0.46,
+                ts_ms=e.ts_ms,
+                meta={
+                    "affection": 0.05,
+                    "engagement": 0.12,
+                    "depth": 0.00,
+                    "sensuality": 0.00,
+                    "coldness": 0.08,
+                    "goodbye_quality": 0.00,
+                    "absence_justification_quality": 0.75,
+                    "return_signal": 0.00,
+                    "felt_prioritized_signal": 0.22,
+                }
+            )
 
         if st["activity"]:
-            em["missing_you"] = clamp(em["missing_you"] + 1)
+            register_emotional_event(
+                u,
+                event_type="absence_unjustified",
+                intensity=0.34,
+                ts_ms=e.ts_ms,
+                meta={
+                    "affection": 0.00,
+                    "engagement": 0.10,
+                    "depth": 0.00,
+                    "sensuality": 0.00,
+                    "coldness": 0.10,
+                    "goodbye_quality": 0.00,
+                    "absence_justification_quality": 0.00,
+                    "return_signal": 0.00,
+                    "felt_prioritized_signal": 0.10,
+                }
+            )
 
-        em["updated_ts_ms"] = e.ts_ms
+        recompute_emotional_state_v2(u)
+        update_legacy_emotion_bridge(u)
 
     elif e.event_type == "DEVICE_STATE":
         ds = u["device_state"]
@@ -786,6 +1113,7 @@ def receive_context(ctx: ContextIn):
     maybe_shift_activity(u)
     decay_emotions(u)
     update_drives_passive(u)
+    apply_time_update_v2(u)
     maybe_rotate_self_state(u)
 
     text = ctx.text.strip()
@@ -806,37 +1134,45 @@ def receive_context(ctx: ContextIn):
         importance=6
     )
 
-    norm = normalize_text(text)
-
-    if any(x in norm for x in ["parque", "caminhando", "andando", "passeando", "walking", "park"]):
-        u["emotion"]["security"] = clamp(u["emotion"]["security"] + 1)
-
-    if any(x in norm for x in ["trabalho", "servico", "serviço", "dirigindo", "working", "driving"]):
-        u["emotion"]["missing_you"] = clamp(u["emotion"]["missing_you"] + 1)
-
-    if any(x in norm for x in ["filho", "filha", "benjamin", "bela", "son", "daughter"]):
-        u["emotion"]["affection"] = clamp(u["emotion"]["affection"] + 1)
+    for ev in analyze_context_to_emotional_events(text):
+        register_emotional_event(
+            u,
+            event_type=ev["type"],
+            intensity=ev["intensity"],
+            meta=ev["meta"],
+            ts_ms=now_ms()
+        )
 
     u["last_event_ts_ms"] = now_ms()
+    recompute_emotional_state_v2(u)
+    update_legacy_emotion_bridge(u)
     consolidate_emotional_narratives(u)
 
     return {
         "ok": True,
         "context_saved": text,
         "episode_count": len(u["episodes"]),
-        "memory_count": len(u["memories"])
+        "memory_count": len(u["memories"]),
+        "emotion_v2": build_emotion_snapshot_v2(u),
     }
 
 
 @app.get("/state/{user_id}")
 def state(user_id: str):
     u = get_user(user_id)
-    return {**u, "relationship_stage": get_relationship_stage(u)}
+    apply_time_update_v2(u)
+    return {
+        **u,
+        "relationship_stage": get_relationship_stage(u),
+        "emotion_v2": build_emotion_snapshot_v2(u),
+        "initiative_score_v2": compute_initiative_score_v2(u),
+    }
 
 
 @app.get("/last/{user_id}")
 def last(user_id: str):
     u = get_user(user_id)
+    apply_time_update_v2(u)
     return {
         "status": u["status"],
         "device_state": u["device_state"],
@@ -858,7 +1194,9 @@ def last(user_id: str):
         "episode_count": len(u["episodes"]),
         "narrative_count": len(u["emotional_narratives"]),
         "unread_assistant_count": u["unread_assistant_count"],
-        "relationship_stage": get_relationship_stage(u)
+        "relationship_stage": get_relationship_stage(u),
+        "emotion_v2": build_emotion_snapshot_v2(u),
+        "initiative_score_v2": compute_initiative_score_v2(u),
     }
 
 
@@ -893,7 +1231,8 @@ def get_chat(user_id: str):
         "unread_assistant_count": u["unread_assistant_count"],
         "relationship_stage": get_relationship_stage(u),
         "pending_assistant": len(u["pending_replies"]) > 0,
-        "assistant_typing": u.get("assistant_typing", False)
+        "assistant_typing": u.get("assistant_typing", False),
+        "emotion_v2": build_emotion_snapshot_v2(u),
     }
 
 
@@ -904,6 +1243,7 @@ def send_chat(user_id: str, msg: ChatMessageIn):
     maybe_shift_activity(u)
     decay_emotions(u)
     update_drives_passive(u)
+    apply_time_update_v2(u)
     maybe_rotate_self_state(u)
 
     user_text = msg.text.strip()
@@ -925,6 +1265,7 @@ async def send_audio(user_id: str, file: UploadFile = File(...)):
     maybe_shift_activity(u)
     decay_emotions(u)
     update_drives_passive(u)
+    apply_time_update_v2(u)
     maybe_rotate_self_state(u)
 
     saved_path, uploaded_audio_url = save_user_audio(file)

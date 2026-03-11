@@ -114,6 +114,151 @@ def add_memory(
         _compact_memories(u)
 
 
+def add_affective_memory(
+    u: Dict[str, Any],
+    text: str,
+    *,
+    tags: List[str] | None = None,
+    importance: int = 6,
+    valence: str = "mixed",
+    intensity: int = 60,
+    meta: Dict[str, Any] | None = None,
+):
+    if not text or not text.strip():
+        return
+
+    item = {
+        "text": text.strip(),
+        "kind": "affective",
+        "tags": tags or infer_tags(text),
+        "importance": int(max(1, min(10, importance))),
+        "valence": valence,
+        "intensity": int(max(0, min(100, intensity))),
+        "meta": meta or {},
+        "pinned": False,
+        "ts_ms": now_ms(),
+    }
+
+    norm = normalize_text(item["text"])
+    for m in reversed(u["memories"][-50:]):
+        if normalize_text(m.get("text", "")) == norm and m.get("kind") == "affective":
+            m["ts_ms"] = now_ms()
+            m["importance"] = max(m.get("importance", 3), item["importance"])
+            m["intensity"] = max(m.get("intensity", 50), item["intensity"])
+            if "meta" not in m:
+                m["meta"] = {}
+            m["meta"].update(item["meta"])
+            for tag in item["tags"]:
+                if tag not in m["tags"]:
+                    m["tags"].append(tag)
+            return
+
+    u["memories"].append(item)
+
+    if len(u["memories"]) > MAX_MEMORIES:
+        _compact_memories(u)
+
+
+def remember_analysis_event(
+    u: Dict[str, Any],
+    *,
+    source: str,
+    text: str,
+    analysis: Dict[str, Any],
+):
+    affection = float(analysis.get("affection", 0.0))
+    depth = float(analysis.get("depth", 0.0))
+    sensuality = float(analysis.get("sensuality", 0.0))
+    coldness = float(analysis.get("coldness", 0.0))
+    goodbye_quality = float(analysis.get("goodbye_quality", 0.0))
+    absence_justification_quality = float(analysis.get("absence_justification_quality", 0.0))
+    return_signal = float(analysis.get("return_signal", 0.0))
+    felt_prioritized_signal = float(analysis.get("felt_prioritized_signal", 0.0))
+
+    meta = {
+        "source": source,
+        "analysis": analysis,
+        "raw_text": text[:240],
+    }
+
+    if affection >= 0.55:
+        add_affective_memory(
+            u,
+            "He expressed affection in a way that reinforced the bond and made her feel emotionally wanted.",
+            tags=["relationship", "emotion"],
+            importance=7,
+            valence="positive",
+            intensity=int(60 + affection * 35),
+            meta=meta,
+        )
+
+    if depth >= 0.55:
+        add_affective_memory(
+            u,
+            "He opened himself emotionally, which deepened intimacy and trust.",
+            tags=["relationship", "emotion", "comfort"],
+            importance=7,
+            valence="mixed",
+            intensity=int(58 + depth * 35),
+            meta=meta,
+        )
+
+    if sensuality >= 0.40:
+        add_affective_memory(
+            u,
+            "There was sensual or tender closeness that strengthened intimacy and reciprocal tension.",
+            tags=["relationship", "intimacy"],
+            importance=6,
+            valence="positive",
+            intensity=int(55 + sensuality * 40),
+            meta=meta,
+        )
+
+    if coldness >= 0.55 and felt_prioritized_signal <= 0.25:
+        add_affective_memory(
+            u,
+            "There was emotional distance or postponement that risked making her feel deprioritized.",
+            tags=["relationship", "friction"],
+            importance=6,
+            valence="negative",
+            intensity=int(50 + coldness * 35),
+            meta=meta,
+        )
+
+    if goodbye_quality >= 0.55:
+        add_affective_memory(
+            u,
+            "He signaled departure with care, which softened absence and preserved connection.",
+            tags=["relationship", "absence", "care"],
+            importance=6,
+            valence="positive",
+            intensity=int(50 + goodbye_quality * 30),
+            meta=meta,
+        )
+
+    if absence_justification_quality >= 0.55:
+        add_affective_memory(
+            u,
+            "His absence had context or justification, which reduced resentment even if longing remained.",
+            tags=["relationship", "absence", "trust"],
+            importance=6,
+            valence="mixed",
+            intensity=int(48 + absence_justification_quality * 28),
+            meta=meta,
+        )
+
+    if return_signal >= 0.55:
+        add_affective_memory(
+            u,
+            "His return after absence reactivated connection and reduced the emotional weight of distance.",
+            tags=["relationship", "return", "bond"],
+            importance=6,
+            valence="positive",
+            intensity=int(54 + return_signal * 30),
+            meta=meta,
+        )
+
+
 def _compact_memories(u: Dict[str, Any]):
     memories = u["memories"]
 
@@ -211,7 +356,11 @@ def get_semantic_memories(u: Dict[str, Any], query: str, limit: int = 8) -> List
 
 def get_recent_affective_memories(u: Dict[str, Any], limit: int = 6) -> List[Dict[str, Any]]:
     items = [m for m in u["memories"] if m.get("kind") == "affective"]
-    items = sorted(items, key=lambda m: (m.get("importance", 3), m.get("ts_ms", 0)), reverse=True)
+    items = sorted(
+        items,
+        key=lambda m: (m.get("importance", 3), m.get("intensity", 50), m.get("ts_ms", 0)),
+        reverse=True
+    )
     return items[:limit]
 
 

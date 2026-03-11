@@ -122,10 +122,159 @@ def maybe_record_affective_event_from_assistant(u: Dict[str, Any], assistant_tex
         )
 
 
+def record_analysis_narratives(
+    u: Dict[str, Any],
+    *,
+    analysis: Dict[str, Any],
+    user_text: str,
+):
+    affection = float(analysis.get("affection", 0.0))
+    depth = float(analysis.get("depth", 0.0))
+    sensuality = float(analysis.get("sensuality", 0.0))
+    coldness = float(analysis.get("coldness", 0.0))
+    goodbye_quality = float(analysis.get("goodbye_quality", 0.0))
+    absence_justification_quality = float(analysis.get("absence_justification_quality", 0.0))
+    return_signal = float(analysis.get("return_signal", 0.0))
+    felt_prioritized_signal = float(analysis.get("felt_prioritized_signal", 0.0))
+
+    if affection >= 0.55:
+        add_narrative(
+            u,
+            "He often reinforces the bond through direct affection, which strengthens her sense of being wanted.",
+            category="bond",
+            score=72,
+        )
+
+    if depth >= 0.55:
+        add_narrative(
+            u,
+            "He can approach her with real emotional depth, reinforcing trust and intimate openness.",
+            category="comfort",
+            score=70,
+        )
+
+    if sensuality >= 0.40:
+        add_narrative(
+            u,
+            "Sensual or tender exchanges tend to increase intimacy, reciprocity, and emotional tension between them.",
+            category="intimacy",
+            score=68,
+        )
+
+    if coldness >= 0.55 and felt_prioritized_signal <= 0.25:
+        add_narrative(
+            u,
+            "Coldness or unclear postponement can make disconnection feel sharper when reassurance is weak.",
+            category="friction",
+            score=62,
+        )
+
+    if goodbye_quality >= 0.55:
+        add_narrative(
+            u,
+            "When he signals departure with care, absence becomes easier to bear and resentment decreases.",
+            category="absence",
+            score=66,
+        )
+
+    if absence_justification_quality >= 0.55:
+        add_narrative(
+            u,
+            "Valid explanations for absence reduce resentment, even when longing or boredom remain.",
+            category="absence",
+            score=67,
+        )
+
+    if return_signal >= 0.55:
+        add_narrative(
+            u,
+            "His return after absence has restorative force and helps reestablish emotional continuity.",
+            category="return",
+            score=69,
+        )
+
+
 def consolidate_emotional_narratives(u: Dict[str, Any]):
     em = u["emotion"]
     drives = u["drives"]
 
+    v2 = u.get("emotion_v2", {})
+    stable = v2.get("stable", {})
+    medium = v2.get("medium", {})
+    fast = v2.get("fast", {})
+
+    attachment = float(stable.get("attachment", 0.0))
+    relational_security = float(stable.get("relational_security", 0.0))
+    sexual_discovery = float(stable.get("sexual_discovery", 0.0))
+
+    boredom = float(medium.get("boredom", 0.0))
+    affection_need = float(medium.get("affection_need", 0.0))
+    felt_considered = float(medium.get("felt_considered", 0.0))
+    felt_abandoned = float(medium.get("felt_abandoned", 0.0))
+    sexual_openness = float(medium.get("sexual_openness", 0.0))
+
+    sexual_desire = float(fast.get("sexual_desire", 0.0))
+    saudade_activation = float(fast.get("saudade_activation", 0.0))
+    romantic_tension = float(fast.get("romantic_tension", 0.0))
+    sensual_tension = float(fast.get("sensual_tension", 0.0))
+
+    if attachment >= 0.62 and relational_security >= 0.60:
+        add_narrative(
+            u,
+            "The relationship has moved beyond simple curiosity into stable emotional continuity and attachment.",
+            category="relationship_stage",
+            score=80,
+        )
+
+    if relational_security >= 0.68 and felt_considered >= 0.60:
+        add_narrative(
+            u,
+            "Trust and felt consideration have become stabilizing forces in the relationship.",
+            category="trust",
+            score=74,
+        )
+
+    if affection_need >= 0.55 or saudade_activation >= 0.58:
+        add_narrative(
+            u,
+            "Absence tends to become emotionally meaningful for her, often activating longing rather than neutrality.",
+            category="absence",
+            score=68,
+        )
+
+    if felt_abandoned >= 0.45:
+        add_narrative(
+            u,
+            "Unclear distance or weak reassurance can accumulate into emotional sharpness or hurt.",
+            category="friction",
+            score=63,
+        )
+
+    if boredom >= 0.55 and affection_need >= 0.45:
+        add_narrative(
+            u,
+            "Silence and lack of stimulation can turn into relational boredom mixed with longing for contact.",
+            category="absence",
+            score=61,
+        )
+
+    if romantic_tension >= 0.45:
+        add_narrative(
+            u,
+            "Romantic tension has become part of the bond, shaping tone, timing, and emotional rhythm.",
+            category="intimacy",
+            score=67,
+        )
+
+    if sensual_tension >= 0.40 or sexual_desire >= 0.42 or sexual_openness >= 0.45 or sexual_discovery >= 0.35:
+        add_narrative(
+            u,
+            "Sensuality is emerging as a real dimension of intimacy, progressively linked to trust and emotional closeness.",
+            category="intimacy",
+            score=66,
+        )
+
+    # ponte temporária com legado
     if em["affection"] >= 75 and drives["attachment"] >= 60:
         add_narrative(
             u,
@@ -140,22 +289,6 @@ def consolidate_emotional_narratives(u: Dict[str, Any]):
             "Trust and predictability have become important stabilizing forces in the relationship.",
             category="trust",
             score=72,
-        )
-
-    if em["missing_you"] >= 55:
-        add_narrative(
-            u,
-            "Absence tends to become emotionally meaningful for her rather than neutral.",
-            category="absence",
-            score=65,
-        )
-
-    if em["frustration"] >= 45:
-        add_narrative(
-            u,
-            "Repeated disconnection or unclear postponement can accumulate into irritation or emotional sharpness.",
-            category="friction",
-            score=60,
         )
 
     compact_narratives(u)
