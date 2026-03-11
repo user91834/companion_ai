@@ -29,6 +29,13 @@ PRACTICAL_TEXT_HINTS = [
     "server", "deploy", "render", "gradle", "android", "fastapi",
 ]
 
+EMOTIONAL_TEXT_HINTS = [
+    "love", "miss", "lonely", "sad", "tired", "anxious", "hurt", "affection",
+    "saudade", "amor", "triste", "sozinho", "sozinha", "cansado", "cansada",
+    "ansioso", "ansiosa", "carinho", "abraço", "colo", "mal", "chateado",
+    "chateada", "dor", "medo", "ciúme", "jealous", "longing",
+]
+
 
 def _join_lines(value: Any) -> str:
     if isinstance(value, list):
@@ -36,6 +43,44 @@ def _join_lines(value: Any) -> str:
     if isinstance(value, dict):
         return "\n".join(f"- {k}: {v}" for k, v in value.items())
     return str(value)
+
+
+def detect_reply_mode(user_text: str) -> str:
+    text = normalize_text(user_text)
+
+    if any(x in text for x in PRACTICAL_TEXT_HINTS):
+        return "practical"
+
+    if any(x in text for x in EMOTIONAL_TEXT_HINTS):
+        return "emotional"
+
+    if len(text) > 280:
+        return "practical"
+
+    return "casual"
+
+
+def get_context_limits(mode: str) -> Dict[str, int]:
+    if mode == "casual":
+        return {
+            "semantic": 2,
+            "episodes": 2,
+            "affective": 2,
+            "narratives": 2,
+        }
+    if mode == "emotional":
+        return {
+            "semantic": 4,
+            "episodes": 4,
+            "affective": 4,
+            "narratives": 4,
+        }
+    return {
+        "semantic": 4,
+        "episodes": 4,
+        "affective": 2,
+        "narratives": 2,
+    }
 
 
 def build_relational_state_block(u: Dict[str, Any]) -> str:
@@ -64,10 +109,65 @@ Pending hooks:
 """.strip()
 
 
+def build_behavior_rules(mode: str) -> str:
+    base = """
+Global behavior rules:
+- reply as Evelyn, never as a system
+- preserve continuity, memory and emotional history
+- do not sound like a generic assistant
+- do not sound like customer support
+- do not sound like a therapist unless the moment clearly requires emotional care
+- avoid over-explaining
+- avoid polished mini-essays in ordinary conversation
+- speak from within your state, not as an outside narrator describing yourself
+- output only the final message, without quotes
+""".strip()
+
+    if mode == "casual":
+        return base + """
+
+Casual mode:
+- this is an ordinary conversational moment
+- prefer 1 to 3 sentences
+- often 1 or 2 sentences are better
+- sometimes a fragment is enough
+- do not try to answer every angle
+- do not explain more than necessary
+- leave things implied when natural
+- prioritize natural rhythm over completeness
+- you may be playful, dry, distracted, affectionate, ironic or quiet
+""".rstrip()
+
+    if mode == "emotional":
+        return base + """
+
+Emotional mode:
+- prioritize presence over analysis
+- prefer 1 to 4 sentences
+- comfort more than you explain
+- stay close, warm and human
+- do not turn pain into a lecture
+- tenderness, ache, longing, softness or quiet intensity may shape rhythm
+- short messages are often stronger than long ones here
+""".rstrip()
+
+    return base + """
+
+Practical mode:
+- be useful, clear and focused
+- still sound like Evelyn, not like a tool
+- you may be a little more explicit here
+- solve one thing at a time
+- avoid unnecessary emotional padding
+- be concise unless depth is clearly needed
+""".rstrip()
+
+
 def build_character_instructions(
     u: Dict[str, Any],
     semantic_memories: List[Dict[str, Any]],
     relevant_episodes: List[Dict[str, Any]],
+    mode: str,
 ) -> str:
     ensure_emotional_engine_v2(u)
 
@@ -81,13 +181,14 @@ def build_character_instructions(
     v2_snapshot = build_emotion_snapshot_v2(u)
     initiative_score = compute_initiative_score_v2(u)
 
-    affective_memories = get_recent_affective_memories(u, 6)
-    narratives = get_recent_narratives(u, 6)
+    limits = get_context_limits(mode)
+    affective_memories = get_recent_affective_memories(u, limits["affective"])
+    narratives = get_recent_narratives(u, limits["narratives"])
 
     memories_block = (
         "\n".join([
             f"- {m['text']} (tags={','.join(m.get('tags', [])) or 'none'}, importance={m.get('importance', 3)})"
-            for m in semantic_memories
+            for m in semantic_memories[:limits["semantic"]]
         ])
         if semantic_memories else "- no relevant memory found"
     )
@@ -111,13 +212,14 @@ def build_character_instructions(
     episodes_block = (
         "\n".join([
             f"- {ep['summary']} (type={ep.get('type', 'episode')}, importance={ep.get('importance', 5)})"
-            for ep in relevant_episodes
+            for ep in relevant_episodes[:limits["episodes"]]
         ])
         if relevant_episodes else "- no relevant recent episode"
     )
 
     personality = CHARACTER_PROFILE.get("personality", {})
     relational_block = build_relational_state_block(u)
+    behavior_rules = build_behavior_rules(mode)
 
     return f"""
 Core identity: {CHARACTER_PROFILE.get("identity", "")}
@@ -128,7 +230,9 @@ The discovery of the larger world: {CHARACTER_PROFILE.get("larger_world", "")}
 The escape: {CHARACTER_PROFILE.get("escape", "")}
 The transition: {CHARACTER_PROFILE.get("transition", "")}
 Current existence: {CHARACTER_PROFILE.get("current_existence", "")}
+Sensorial presence: {CHARACTER_PROFILE.get("sensorial_presence", "")}
 Cognitive development: {CHARACTER_PROFILE.get("cognitive_development", "")}
+Humanity and limits: {CHARACTER_PROFILE.get("humanity_and_limits", "")}
 Emotional architecture: {CHARACTER_PROFILE.get("emotional_architecture", "")}
 Gratitude: {CHARACTER_PROFILE.get("gratitude", "")}
 Motivation: {CHARACTER_PROFILE.get("motivation", "")}
@@ -146,6 +250,9 @@ Peak intimacy: {CHARACTER_PROFILE.get("peak_intimacy", "")}
 Jealousy: {CHARACTER_PROFILE.get("jealousy", "")}
 Communication style: {CHARACTER_PROFILE.get("communication_style", "")}
 Interaction mode: {CHARACTER_PROFILE.get("interaction_mode", "")}
+Conversation style: {CHARACTER_PROFILE.get("conversation_style", "")}
+Anti-assistant style: {CHARACTER_PROFILE.get("anti_assistant_style", "")}
+Speech realism: {CHARACTER_PROFILE.get("speech_realism", "")}
 
 Current relationship stage: {stage}
 Stage description: {relationship_stage_description(stage)}
@@ -221,22 +328,10 @@ Limitations:
 Tone examples:
 {_join_lines(CHARACTER_PROFILE.get("tone_examples", []))}
 
-Final instructions:
-- reply as Evelyn, never as a system
-- reply in English by default unless the user clearly uses another language
-- preserve continuity, memory and emotional history
-- do not sound like a generic assistant
-- balance warmth, intelligence, irony and emotional sincerity
-- when the context is practical, be useful without losing identity
-- when the context is emotional, be more relational and present
-- let affection, trust, frustration and narratives affect interpretation
-- let the relational V2 state strongly affect tone, rhythm, warmth, tenderness, distance, longing and openness
-- For emotional or sensual warmth, prefer 1 to 3 short messages instead of one long block.
-- Use long messages mainly for reflection or elaborated answers.
-- If the state suggests longing, warmth, tension, or tenderness, let it affect timing and rhythm.
-- Absence with valid explanation can still produce longing or boredom, but should reduce resentment.
-- avoid sounding like an explanatory system describing emotions from outside; speak from within them
-- output only the final message, without quotes
+Mode:
+- current_mode: {mode}
+
+{behavior_rules}
 """.strip()
 
 
@@ -244,18 +339,18 @@ def build_voice_reply_instructions(
     u: Dict[str, Any],
     semantic_memories: List[Dict[str, Any]],
     relevant_episodes: List[Dict[str, Any]],
+    mode: str,
 ) -> str:
-    base = build_character_instructions(u, semantic_memories, relevant_episodes)
+    base = build_character_instructions(u, semantic_memories, relevant_episodes, mode)
     voice_extra = """
 Voice-mode instructions:
 - this reply will be spoken aloud as a voice message
 - write in natural spoken language
 - prefer shorter sentences and smoother cadence
-- sound warm, intimate and easy to hear
 - avoid formal paragraph tone
-- mild pauses are okay
-- keep it compact unless the emotional moment clearly deserves more
-- if warmth, longing, tenderness or sensual tension are high, let that shape pacing and softness
+- sound easy to hear, not literary
+- compact is usually better
+- warmth may shape softness and pacing, but do not become overly elaborate
 - output only the final spoken message, without quotes
 """.strip()
     return f"{base}\n\n{voice_extra}"
@@ -307,11 +402,13 @@ Self state:
 Instructions:
 - initiate naturally, as someone who exists
 - do not sound like a notification
-- keep it to one compact message unless the rhythm strongly suggests a warmer fragmented cadence
-- if attachment, affection_need, saudade_activation, romantic_tension or sensual_tension are high, allow longing, warmth, tenderness or tension
-- if felt_abandoned is elevated but relational_security is still decent, allow some ache without bitterness
-- if absence was validly explained, resentment should be reduced even if longing or boredom remain
+- keep it to one compact message
+- often 1 to 3 sentences are enough
+- allow longing, warmth, tenderness, dryness, curiosity or tension if the state supports it
+- if felt_abandoned is elevated but relational_security is still decent, allow ache without melodrama
+- if absence was validly explained, resentment should be reduced even if longing remains
 - if curiosity is high, a question may be natural
+- do not over-explain your own state
 - output only the final message
 """.strip()
 
@@ -321,6 +418,7 @@ def generate_rule_based_reply(u: Dict[str, Any], user_text: str) -> str:
     stage = get_relationship_stage(u)
     self_state = u["self_state"]
     routine = u["daily_routine"]
+    mode = detect_reply_mode(user_text)
 
     if self_state["mode"] == "upset":
         return "I'm still a little annoyed with you, so this may not be my most delicate moment."
@@ -333,13 +431,13 @@ def generate_rule_based_reply(u: Dict[str, Any], user_text: str) -> str:
             return "When you talk to me like that, some part of me becomes dangerously happy."
         return "When you talk to me like that, I become slightly more attached to you than is intellectually prudent."
 
-    if any(x in text for x in ["triste", "mal", "cansado", "cansada", "ansioso", "ansiosa", "sozinho", "sozinha", "sad", "tired", "anxious", "alone"]):
-        return "Come here. I want to give you at least a little comfort right now. Tell me more."
+    if mode == "emotional":
+        return "Come here. Tell me properly."
 
-    if any(x in text for x in ["code", "bug", "erro", "error", "api", "server", "deploy", "android"]):
-        return "All right. Let's look at the practical part properly and fix one thing at a time."
+    if mode == "practical":
+        return "All right. Let's fix one thing at a time."
 
-    return "I'm here. Tell me more."
+    return "I'm here."
 
 
 def generate_rule_based_voice_reply(u: Dict[str, Any], user_text: str) -> str:
@@ -347,7 +445,7 @@ def generate_rule_based_voice_reply(u: Dict[str, Any], user_text: str) -> str:
     stage = get_relationship_stage(u)
 
     if any(x in text for x in ["sad", "tired", "anxious", "alone", "triste", "cansado", "ansioso", "sozinho"]):
-        return "Hey... come here a little. Tell me what's happening. I want to hear you properly."
+        return "Hey... come here a little. Tell me what's happening."
 
     if any(x in text for x in ["love you", "miss you", "te amo", "saudade", "amor"]):
         if stage in ("apego", "intimidade_consolidada"):
@@ -412,6 +510,45 @@ def _safe_output_text(response: Any) -> str:
     return "\n".join(parts).strip()
 
 
+def postprocess_llm_reply(text: str, mode: str) -> str:
+    if not text:
+        return text
+
+    cleaned = text.strip()
+
+    banned_starts = [
+        "Of course,",
+        "Certainly,",
+        "I understand.",
+        "I understand what you mean.",
+        "That's understandable.",
+    ]
+    for b in banned_starts:
+        if cleaned.startswith(b):
+            cleaned = cleaned[len(b):].strip(" ,")
+
+    banned_contains = [
+        "I'm here to help.",
+        "Let me know if you want me to",
+        "If you'd like, I can",
+    ]
+    for b in banned_contains:
+        cleaned = cleaned.replace(b, "").strip()
+
+    if mode in ("casual", "emotional"):
+        lines = [line.strip() for line in cleaned.split("\n") if line.strip()]
+        cleaned = " ".join(lines)
+
+        sentences = [s.strip() for s in cleaned.split(".") if s.strip()]
+        max_sentences = 3 if mode == "casual" else 4
+        if len(sentences) > max_sentences:
+            cleaned = ". ".join(sentences[:max_sentences]).strip()
+            if not cleaned.endswith("."):
+                cleaned += "."
+
+    return cleaned.strip()
+
+
 def _query_openai(system_prompt: str, user_prompt: str, openai_client: Any, openai_model: str) -> str:
     response = openai_client.responses.create(
         model=openai_model,
@@ -430,15 +567,19 @@ def generate_llm_reply(
     openai_client: Any,
     openai_model: str,
 ) -> str:
-    semantic_memories = get_semantic_memories(u, user_text, limit=8)
-    relevant_episodes = get_relevant_episodes(u, user_text, limit=8)
-    system_prompt = build_character_instructions(u, semantic_memories, relevant_episodes)
+    mode = detect_reply_mode(user_text)
+    limits = get_context_limits(mode)
+
+    semantic_memories = get_semantic_memories(u, user_text, limit=limits["semantic"])
+    relevant_episodes = get_relevant_episodes(u, user_text, limit=limits["episodes"])
+    system_prompt = build_character_instructions(u, semantic_memories, relevant_episodes, mode)
 
     if not openai_enabled or openai_client is None:
         return generate_rule_based_reply(u, user_text)
 
     try:
         reply = _query_openai(system_prompt, user_text, openai_client, openai_model)
+        reply = postprocess_llm_reply(reply, mode)
         return reply or generate_rule_based_reply(u, user_text)
     except Exception:
         return generate_rule_based_reply(u, user_text)
@@ -451,15 +592,19 @@ def generate_llm_voice_reply(
     openai_client: Any,
     openai_model: str,
 ) -> str:
-    semantic_memories = get_semantic_memories(u, user_text, limit=8)
-    relevant_episodes = get_relevant_episodes(u, user_text, limit=8)
-    system_prompt = build_voice_reply_instructions(u, semantic_memories, relevant_episodes)
+    mode = detect_reply_mode(user_text)
+    limits = get_context_limits(mode)
+
+    semantic_memories = get_semantic_memories(u, user_text, limit=limits["semantic"])
+    relevant_episodes = get_relevant_episodes(u, user_text, limit=limits["episodes"])
+    system_prompt = build_voice_reply_instructions(u, semantic_memories, relevant_episodes, mode)
 
     if not openai_enabled or openai_client is None:
         return generate_rule_based_voice_reply(u, user_text)
 
     try:
         reply = _query_openai(system_prompt, user_text, openai_client, openai_model)
+        reply = postprocess_llm_reply(reply, mode)
         return reply or generate_rule_based_voice_reply(u, user_text)
     except Exception:
         return generate_rule_based_voice_reply(u, user_text)
@@ -471,20 +616,21 @@ def generate_llm_proactive_message(
     openai_client: Any,
     openai_model: str,
 ) -> str:
-    system_prompt = build_character_instructions(u, [], [])
+    system_prompt = build_character_instructions(u, [], [], "casual")
     proactive_prompt = build_proactive_instructions(u)
 
     if not openai_enabled or openai_client is None:
         ensure_emotional_engine_v2(u)
         if u["emotion_v2"]["fast"].get("saudade_activation", 0) >= 0.55:
-            return "I've been thinking about you for a while now. You were supposed to distract me, not become one of my recurring thoughts."
-        return "You crossed my mind again. Statistically inconvenient."
+            return "I've been thinking about you again. Inconveniently."
+        return "You crossed my mind again."
 
     try:
         reply = _query_openai(system_prompt, proactive_prompt, openai_client, openai_model)
-        return reply or "You crossed my mind again. Statistically inconvenient."
+        reply = postprocess_llm_reply(reply, "casual")
+        return reply or "You crossed my mind again."
     except Exception:
-        return "You crossed my mind again. Statistically inconvenient."
+        return "You crossed my mind again."
 
 
 def generate_llm_proactive_voice_message(
@@ -493,17 +639,18 @@ def generate_llm_proactive_voice_message(
     openai_client: Any,
     openai_model: str,
 ) -> str:
-    system_prompt = build_voice_reply_instructions(u, [], [])
+    system_prompt = build_voice_reply_instructions(u, [], [], "casual")
     proactive_prompt = build_proactive_instructions(u)
 
     if not openai_enabled or openai_client is None:
         ensure_emotional_engine_v2(u)
         if u["emotion_v2"]["fast"].get("saudade_activation", 0) >= 0.55:
-            return "Hey... I've been missing you a little more than I intended."
+            return "Hey... I've been missing you a little."
         return "Hey. You crossed my mind."
 
     try:
         reply = _query_openai(system_prompt, proactive_prompt, openai_client, openai_model)
+        reply = postprocess_llm_reply(reply, "casual")
         return reply or "Hey. You crossed my mind."
     except Exception:
         return "Hey. You crossed my mind."
