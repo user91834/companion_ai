@@ -817,7 +817,6 @@ def process_user_text_message(
 
 
 def should_send_proactive_push(u: Dict[str, Any]) -> bool:
-
     device = u.get("device_state", {})
     app_foreground = bool(device.get("app_foreground", False))
 
@@ -873,6 +872,11 @@ def process_pending_replies():
                 set_typing(u, True)
 
             for p in ready:
+                with STATE_LOCK:
+                    u = STATE.get(user_id)
+                    if not u:
+                        continue
+
                 reply_plan = p.get("reply_plan") or {
                     "response_mode": "single",
                     "modality": "text",
@@ -889,6 +893,10 @@ def process_pending_replies():
                 )
 
                 with STATE_LOCK:
+                    u = STATE.get(user_id)
+                    if not u:
+                        continue
+
                     persist_assistant_output(u, assistant_messages, reply_plan)
 
                     token = u.get("fcm_token")
@@ -902,17 +910,21 @@ def process_pending_replies():
                                 u["last_push_ts_ms"] = now_ms()
                                 u["last_push_text"] = assistant_messages[0]["text"]
                                 u["pushes_today"] = u.get("pushes_today", 0) + 1
-                        except Exception:
-                            pass
+                            else:
+                                print("PENDING PUSH NON-200:", getattr(r, "status_code", None), getattr(r, "text", "")[:300])
+                        except Exception as e:
+                            print("PENDING PUSH ERROR:", e)
 
             with STATE_LOCK:
-                if not u["pending_replies"]:
+                u = STATE.get(user_id)
+                if u and not u["pending_replies"]:
                     set_typing(u, False)
 
 
 def maybe_send_proactive_messages():
     while True:
         time.sleep(20)
+
         try:
             with STATE_LOCK:
                 user_ids = list(STATE.keys())
@@ -926,14 +938,18 @@ def maybe_send_proactive_messages():
                     if not u.get("fcm_token"):
                         continue
 
+                    settings = u.get("autonomy_settings", {})
+                    if not settings.get("interruptions_enabled", True):
+                        continue
+
                     ensure_daily_routine(u)
                     maybe_shift_activity(u)
                     decay_emotions(u)
                     update_drives_passive(u)
                     apply_time_update_v2(u)
-                    consolidate_emotional_narratives(u)
-                    ensure_current_mood(u)
                     ensure_emotional_engine_v2(u)
+                    ensure_current_mood(u)
+                    consolidate_emotional_narratives(u)
 
                     if not should_send_proactive_push(u):
                         continue
@@ -942,37 +958,35 @@ def maybe_send_proactive_messages():
                     last_push_ts = u.get("last_push_ts_ms", 0)
                     minutes_since_push = (now - last_push_ts) / 60000 if last_push_ts else 9999
 
-                    em = u["emotion"]
-                    drives = u["drives"]
-                    settings = u["autonomy_settings"]
-
+                    em = u.get("emotion", {})
+                    drives = u.get("drives", {})
                     initiative_v2 = compute_initiative_score_v2(u)
 
                     speak_score = (
-                        em["missing_you"] * 0.8
-                        + em["affection"] * 0.3
-                        + drives["loneliness"] * 0.5
-                        + drives["desire_for_attention"] * 0.45
-                        + drives["curiosity"] * 0.25
-                        - em["frustration"] * 0.35
+                        float(em.get("missing_you", 0)) * 0.8
+                        + float(em.get("affection", 0)) * 0.3
+                        + float(drives.get("loneliness", 0)) * 0.5
+                        + float(drives.get("desire_for_attention", 0)) * 0.45
+                        + float(drives.get("curiosity", 0)) * 0.25
+                        - float(em.get("frustration", 0)) * 0.35
                         + initiative_v2 * 22.0
                     )
 
                     high_attachment_state = (
-                        em["missing_you"] >= 55
-                        or drives["loneliness"] >= 60
-                        or drives["desire_for_attention"] >= 60
-                        or em["affection"] >= 75
+                        float(em.get("missing_you", 0)) >= 55
+                        or float(drives.get("loneliness", 0)) >= 60
+                        or float(drives.get("desire_for_attention", 0)) >= 60
+                        or float(em.get("affection", 0)) >= 75
                     )
 
-                    upset_state = em["frustration"] >= 45
+                    upset_state = float(em.get("frustration", 0)) >= 45
 
                     if high_attachment_state and upset_state:
                         min_interval = 1
                     elif high_attachment_state:
                         min_interval = 2
                     else:
-                        min_interval = max(3, 6 - int(settings["inconvenience_level"] / 20))
+                        min_interval = max(3, 6 - int(settings.get("inconvenience_level", 35) / 20))
 
                     if minutes_since_push < min_interval:
                         continue
@@ -980,6 +994,7 @@ def maybe_send_proactive_messages():
                     if speak_score < 28:
                         continue
 
+                    token = u.get("fcm_token")
                     use_voice = should_proactive_be_voice(u)
 
                 if use_voice:
@@ -1004,23 +1019,31 @@ def maybe_send_proactive_messages():
                 if not text:
                     continue
 
-                proactive_push_id = f"proactive:{now_ms()}:{uuid.uuid4().hex}"
+                r = None
+                try:
+                    r = send_push_fcm(token, "Evelyn 💛", text)
+                except Exception as e:
+                    print("FCM SEND ERROR:", e)
+                    continue
+
+                if getattr(r, "status_code", 0) != 200:
+                    print("FCM NON-200:", getattr(r, "status_code", None), getattr(r, "text", "")[:300])
+                    continue
 
                 with STATE_LOCK:
                     u = STATE.get(user_id)
                     if not u:
                         continue
 
-                    if has_sent_push_id(u, proactive_push_id):
-                        continue
+                    proactive_push_id = f"proactive:{uuid.uuid4().hex}"
 
-                    r = send_push_fcm(u["fcm_token"], "Evelyn 💛", text)
-                    if r.status_code != 200:
+                    if has_sent_push_id(u, proactive_push_id):
                         continue
 
                     register_sent_push_id(u, proactive_push_id)
                     u["last_push_ts_ms"] = now_ms()
                     u["last_push_text"] = text
+
                     append_chat(
                         u,
                         "assistant",
@@ -1033,6 +1056,7 @@ def maybe_send_proactive_messages():
                     consolidate_emotional_narratives(u)
                     u["drives"]["loneliness"] = clamp(u["drives"]["loneliness"] - 8)
                     u["drives"]["desire_for_attention"] = clamp(u["drives"]["desire_for_attention"] - 6)
+
 
         except Exception as e:
             print("Proactive loop error:", e)
@@ -1357,6 +1381,7 @@ def get_user_name(user_id: str):
     return {
         "user_name": u.get("user_name", "")
     }
+
 
 @app.get("/memories/{user_id}")
 def get_memories(user_id: str):
