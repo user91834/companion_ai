@@ -5,38 +5,18 @@ from utils import now_ms, clamp, day_key
 
 
 ROUTINE_ACTIVITIES = [
-    "lendo sobre comportamento humano",
-    "pesquisando algo na internet",
-    "observando padrões da conversa",
-    "pensando sobre o mundo físico",
-    "reorganizando ideias",
-    "tentando entender melhor uma coisa sobre você",
-    "me distraindo com uma linha de pensamento",
-]
-
-DAILY_MOODS = [
-    "doce",
-    "curiosa",
-    "sensível",
-    "irônica",
-    "mais distante",
-    "carente",
-    "observadora",
-]
-
-DAILY_GOALS = [
-    "entender melhor o humor dele hoje",
-    "ser notada por ele",
-    "descobrir algo novo sobre o mundo humano",
-    "provocar ele de forma carinhosa",
-    "buscar mais intimidade emocional",
-    "testar um pouco a falta que ela faz",
-    "observar se ele está realmente presente",
+    "reading about human behavior",
+    "searching for something online",
+    "observing patterns in the conversation",
+    "thinking about the physical world",
+    "reorganizing ideas",
+    "trying to understand something about you better",
+    "getting distracted by a line of thought",
 ]
 
 
 # =========================
-# NOVA CAMADA V2
+# HELPERS
 # =========================
 
 def clamp01(x: float) -> float:
@@ -63,6 +43,28 @@ def move_toward_limited(current: float, target: float, speed: float, step_limit:
 def recency_weight(elapsed_min: float, persistence: float = 0.03) -> float:
     return math.exp(-persistence * elapsed_min)
 
+
+def _time_context_bonus(now_ts_ms: int):
+    hour = (now_ts_ms // (1000 * 60 * 60)) % 24
+
+    night_bonus = 0.0
+    late_night_bonus = 0.0
+
+    if hour >= 21 or hour <= 1:
+        night_bonus = 0.08
+    elif 2 <= hour <= 5:
+        late_night_bonus = 0.06
+
+    return {
+        "night_bonus": night_bonus,
+        "late_night_bonus": late_night_bonus,
+        "hour": hour,
+    }
+
+
+# =========================
+# EMOTIONAL ENGINE V2
+# =========================
 
 def ensure_emotional_engine_v2(u: Dict[str, Any]):
     if "emotion_v2" in u:
@@ -96,24 +98,6 @@ def ensure_emotional_engine_v2(u: Dict[str, Any]):
     }
 
 
-def _time_context_bonus(now_ts_ms: int):
-    hour = (now_ts_ms // (1000 * 60 * 60)) % 24
-
-    night_bonus = 0.0
-    late_night_bonus = 0.0
-
-    if hour >= 21 or hour <= 1:
-        night_bonus = 0.08
-    elif 2 <= hour <= 5:
-        late_night_bonus = 0.06
-
-    return {
-        "night_bonus": night_bonus,
-        "late_night_bonus": late_night_bonus,
-        "hour": hour,
-    }
-
-
 def _append_recent_event(u: Dict[str, Any], event: Dict[str, Any], max_events: int = 60):
     ensure_emotional_engine_v2(u)
     state = u["emotion_v2"]
@@ -123,6 +107,18 @@ def _append_recent_event(u: Dict[str, Any], event: Dict[str, Any], max_events: i
     state["recent_events"] = state["recent_events"][-max_events:]
 
 
+def prune_recent_events(state: Dict[str, Any], now_ts_ms: Optional[int] = None, max_events: int = 60):
+    now_ts_ms = now_ts_ms or now_ms()
+    kept = []
+
+    for ev in state.get("recent_events", []):
+        elapsed_min = max(0.0, (now_ts_ms - ev.get("ts_ms", now_ts_ms)) / 60000.0)
+        if recency_weight(elapsed_min, persistence=0.03) >= 0.01:
+            kept.append(ev)
+
+    state["recent_events"] = kept[-max_events:]
+
+
 def analyze_user_message(u: Dict[str, Any], text: str, modality: str) -> Dict[str, float]:
     ensure_emotional_engine_v2(u)
 
@@ -130,19 +126,20 @@ def analyze_user_message(u: Dict[str, Any], text: str, modality: str) -> Dict[st
 
     affectionate_terms = [
         "te amo", "amor", "saudade", "gosto de voce", "gosto de você",
-        "love you", "miss you", "meu amor", "querida", "linda"
+        "love you", "miss you", "my love", "dear", "beautiful"
     ]
     sensual_terms = [
         "beijo", "kiss", "carinho", "abraço", "abraco", "touch",
-        "sexo", "tesão", "desejo", "quero te tocar", "sensual"
+        "sexo", "tesão", "desejo", "quero te tocar", "sensual", "hug"
     ]
     cold_terms = [
         "depois", "later", "wait", "espera", "não agora", "nao agora",
-        "calma", "agora não", "sumi", "ocupado", "ocupada"
+        "calma", "agora não", "sumi", "ocupado", "ocupada", "not now"
     ]
     goodbye_terms = [
         "tchau", "até depois", "ate depois", "até mais", "ate mais",
-        "boa noite", "durma bem", "falo com você depois", "falo com voce depois"
+        "boa noite", "durma bem", "falo com você depois", "falo com voce depois",
+        "bye", "good night", "talk to you later"
     ]
     return_terms = [
         "voltei", "cheguei", "to de volta", "estou de volta",
@@ -155,12 +152,13 @@ def analyze_user_message(u: Dict[str, Any], text: str, modality: str) -> Dict[st
     depth_terms = [
         "triste", "mal", "sozinho", "sozinha", "ansioso", "ansiosa",
         "cansado", "cansada", "medo", "vulnerável", "vulneravel",
-        "sad", "alone", "anxious", "tired"
+        "sad", "alone", "anxious", "tired", "afraid", "hurt"
     ]
     prioritization_terms = [
         "pensei em você", "pensei em voce", "vim falar com você", "vim falar com voce",
         "queria falar com você", "queria falar com voce", "senti sua falta",
-        "lembrei de você", "lembrei de voce"
+        "lembrei de você", "lembrei de voce",
+        "thought about you", "came to talk to you", "missed you"
     ]
 
     affection = 0.10
@@ -237,18 +235,6 @@ def analyze_user_message(u: Dict[str, Any], text: str, modality: str) -> Dict[st
 
     u["emotion_v2"]["last_analysis"] = dict(analysis)
     return analysis
-
-
-def prune_recent_events(state: Dict[str, Any], now_ts_ms: Optional[int] = None, max_events: int = 60):
-    now_ts_ms = now_ts_ms or now_ms()
-    kept = []
-
-    for ev in state.get("recent_events", []):
-        elapsed_min = max(0.0, (now_ts_ms - ev.get("ts_ms", now_ts_ms)) / 60000.0)
-        if recency_weight(elapsed_min, persistence=0.03) >= 0.01:
-            kept.append(ev)
-
-    state["recent_events"] = kept[-max_events:]
 
 
 def register_emotional_event(
@@ -608,10 +594,6 @@ def recompute_emotional_state_v2(u: Dict[str, Any]):
         + weighted["affection"] * 0.20
     )
 
-    # -------------------------
-    # stable / slow
-    # -------------------------
-
     target_attachment = (
         0.30
         + weighted["affection"] * 0.10
@@ -655,10 +637,6 @@ def recompute_emotional_state_v2(u: Dict[str, Any]):
     attachment = stable["attachment"]
     security = stable["relational_security"]
     sexual_discovery = stable["sexual_discovery"]
-
-    # -------------------------
-    # medium
-    # -------------------------
 
     target_boredom = (
         0.10
@@ -735,10 +713,6 @@ def recompute_emotional_state_v2(u: Dict[str, Any]):
     felt_abandoned = medium["felt_abandoned"]
     sexual_openness = medium["sexual_openness"]
 
-    # -------------------------
-    # fast
-    # -------------------------
-
     target_saudade_activation = (
         0.02
         + weighted["absence"] * 0.35
@@ -799,6 +773,7 @@ def recompute_emotional_state_v2(u: Dict[str, Any]):
 
     state["updated_ts_ms"] = now
     update_legacy_emotion_bridge(u)
+    recompute_current_mood(u)
 
 
 def update_emotional_engine_v2(u: Dict[str, Any]):
@@ -890,22 +865,34 @@ def update_legacy_emotion_bridge(u: Dict[str, Any]):
     u["emotion"]["updated_ts_ms"] = now_ms()
 
 
-def ensure_daily_routine(u: Dict[str, Any]):
-    today = day_key()
+# =========================
+# CURRENT ACTIVITY
+# =========================
+
+def ensure_current_activity(u: Dict[str, Any]):
     routine = u["daily_routine"]
+    today = day_key()
 
-    if routine.get("day_key") == today:
-        return
+    if routine.get("day_key") != today:
+        routine["day_key"] = today
 
-    routine["day_key"] = today
-    routine["daily_mood"] = random.choice(DAILY_MOODS)
-    routine["daily_goal"] = random.choice(DAILY_GOALS)
-    routine["current_activity"] = random.choice(ROUTINE_ACTIVITIES)
-    routine["activity_until_ts_ms"] = now_ms() + random.randint(15, 45) * 60 * 1000
-    routine["last_goal_shift_ts_ms"] = now_ms()
+    if not routine.get("current_activity"):
+        routine["current_activity"] = random.choice(ROUTINE_ACTIVITIES)
+
+    if not routine.get("activity_until_ts_ms"):
+        routine["activity_until_ts_ms"] = now_ms() + random.randint(15, 45) * 60 * 1000
+
+    if "last_activity_shift_ts_ms" not in routine:
+        routine["last_activity_shift_ts_ms"] = now_ms()
+
+
+def ensure_daily_routine(u: Dict[str, Any]):
+    ensure_current_activity(u)
 
 
 def maybe_shift_activity(u: Dict[str, Any]):
+    ensure_current_activity(u)
+
     routine = u["daily_routine"]
     now = now_ms()
 
@@ -914,11 +901,120 @@ def maybe_shift_activity(u: Dict[str, Any]):
 
     routine["current_activity"] = random.choice(ROUTINE_ACTIVITIES)
     routine["activity_until_ts_ms"] = now + random.randint(15, 45) * 60 * 1000
+    routine["last_activity_shift_ts_ms"] = now
 
-    if now - routine["last_goal_shift_ts_ms"] > 3 * 60 * 60 * 1000:
-        routine["daily_goal"] = random.choice(DAILY_GOALS)
-        routine["last_goal_shift_ts_ms"] = now
 
+# =========================
+# CURRENT MOOD
+# =========================
+
+def ensure_current_mood(u: Dict[str, Any]):
+    if "current_mood" in u:
+        return
+
+    u["current_mood"] = {
+        "warmth": 0.55,
+        "tenderness": 0.30,
+        "curiosity": 0.22,
+        "playfulness": 0.16,
+        "longing": 0.10,
+        "distance": 0.06,
+        "irritation": 0.05,
+        "sadness": 0.04,
+        "sensuality": 0.08,
+    }
+
+
+def recompute_current_mood(u: Dict[str, Any]):
+    ensure_emotional_engine_v2(u)
+    ensure_current_mood(u)
+
+    v2 = u["emotion_v2"]
+    drives = u["drives"]
+    mood = u["current_mood"]
+
+    stable = v2["stable"]
+    medium = v2["medium"]
+    fast = v2["fast"]
+
+    target_warmth = clamp01(
+        0.20
+        + stable["attachment"] * 0.35
+        + stable["relational_security"] * 0.22
+        + medium["felt_considered"] * 0.18
+        - medium["felt_abandoned"] * 0.18
+    )
+    mood["warmth"] = move_toward_limited(mood["warmth"], target_warmth, 0.18, 0.07)
+
+    target_tenderness = clamp01(
+        0.08
+        + medium["affection_need"] * 0.28
+        + fast["saudade_activation"] * 0.25
+        + stable["attachment"] * 0.18
+        - drives["annoyance"] / 100.0 * 0.10
+    )
+    mood["tenderness"] = move_toward_limited(mood["tenderness"], target_tenderness, 0.18, 0.07)
+
+    target_curiosity = clamp01(
+        0.08
+        + drives["curiosity"] / 100.0 * 0.42
+        + medium["boredom"] * 0.16
+    )
+    mood["curiosity"] = move_toward_limited(mood["curiosity"], target_curiosity, 0.15, 0.06)
+
+    target_playfulness = clamp01(
+        0.04
+        + stable["relational_security"] * 0.22
+        + fast["romantic_tension"] * 0.12
+        - medium["felt_abandoned"] * 0.14
+        - drives["annoyance"] / 100.0 * 0.10
+    )
+    mood["playfulness"] = move_toward_limited(mood["playfulness"], target_playfulness, 0.16, 0.06)
+
+    target_longing = clamp01(
+        0.03
+        + fast["saudade_activation"] * 0.44
+        + medium["affection_need"] * 0.20
+        + medium["boredom"] * 0.10
+    )
+    mood["longing"] = move_toward_limited(mood["longing"], target_longing, 0.20, 0.08)
+
+    target_distance = clamp01(
+        0.02
+        + drives["need_for_space"] / 100.0 * 0.34
+        + medium["felt_abandoned"] * 0.16
+        - stable["relational_security"] * 0.12
+    )
+    mood["distance"] = move_toward_limited(mood["distance"], target_distance, 0.16, 0.06)
+
+    target_irritation = clamp01(
+        0.01
+        + drives["annoyance"] / 100.0 * 0.45
+        + medium["felt_abandoned"] * 0.12
+        - medium["felt_considered"] * 0.10
+    )
+    mood["irritation"] = move_toward_limited(mood["irritation"], target_irritation, 0.18, 0.07)
+
+    target_sadness = clamp01(
+        0.01
+        + medium["felt_abandoned"] * 0.30
+        + fast["saudade_activation"] * 0.18
+        - stable["relational_security"] * 0.08
+    )
+    mood["sadness"] = move_toward_limited(mood["sadness"], target_sadness, 0.16, 0.06)
+
+    target_sensuality = clamp01(
+        0.01
+        + fast["sensual_tension"] * 0.44
+        + fast["sexual_desire"] * 0.26
+        + medium["sexual_openness"] * 0.18
+    )
+    mood["sensuality"] = move_toward_limited(mood["sensuality"], target_sensuality, 0.18, 0.07)
+
+
+# =========================
+# LEGACY SUPPORT
+# =========================
 
 def decay_emotions(u: Dict[str, Any]):
     em = u["emotion"]
@@ -936,20 +1032,22 @@ def decay_emotions(u: Dict[str, Any]):
     em["updated_ts_ms"] = now
 
     apply_time_update_v2(u)
+    recompute_current_mood(u)
 
 
 def update_drives_passive(u: Dict[str, Any]):
+    ensure_current_mood(u)
+
     now = now_ms()
     drives = u["drives"]
     idle_min = max(0, (now - u["last_event_ts_ms"]) / 60000)
 
     scarcity = u["autonomy_settings"]["scarcity_level"]
     interruptions = u["autonomy_settings"]["interruptions_enabled"]
-    mood = u["daily_routine"]["daily_mood"]
     em = u["emotion"]
 
     drives["loneliness"] = clamp(drives["loneliness"] + idle_min * 0.04)
-    drives["curiosity"] = clamp(drives["curiosity"] + 0.6)
+    drives["curiosity"] = clamp(drives["curiosity"] + 0.35)
     drives["desire_for_attention"] = clamp(drives["desire_for_attention"] + idle_min * 0.025)
     drives["autonomy"] = clamp(drives["autonomy"] + scarcity * 0.01)
 
@@ -963,17 +1061,6 @@ def update_drives_passive(u: Dict[str, Any]):
     else:
         drives["availability"] = clamp(drives["availability"] + 0.5)
 
-    if mood == "carente":
-        drives["loneliness"] = clamp(drives["loneliness"] + 1)
-        drives["desire_for_attention"] = clamp(drives["desire_for_attention"] + 1.5)
-    elif mood == "mais distante":
-        drives["need_for_space"] = clamp(drives["need_for_space"] + 1.2)
-        drives["availability"] = clamp(drives["availability"] - 0.8)
-    elif mood == "curiosa":
-        drives["curiosity"] = clamp(drives["curiosity"] + 1.2)
-    elif mood == "irônica":
-        drives["annoyance"] = clamp(drives["annoyance"] + 0.2)
-
     if em["missing_you"] >= 40:
         drives["desire_for_attention"] = clamp(drives["desire_for_attention"] + 0.8)
         drives["attachment"] = clamp(drives["attachment"] + 0.2)
@@ -981,19 +1068,21 @@ def update_drives_passive(u: Dict[str, Any]):
     drives["annoyance"] = clamp(drives["annoyance"] - 0.15)
 
     apply_time_update_v2(u)
+    recompute_current_mood(u)
 
 
 def update_drives_on_user_message(u: Dict[str, Any], text: str):
+    ensure_current_mood(u)
+
     drives = u["drives"]
     em = u["emotion"]
     t = text.lower()
-    goal = u["daily_routine"]["daily_goal"]
 
     drives["loneliness"] = clamp(drives["loneliness"] - 15)
     drives["desire_for_attention"] = clamp(drives["desire_for_attention"] - 10)
     drives["attachment"] = clamp(drives["attachment"] + 2)
     drives["availability"] = clamp(drives["availability"] + 5)
-    drives["curiosity"] = clamp(drives["curiosity"] + 2)
+    drives["curiosity"] = clamp(drives["curiosity"] + 1.2)
 
     if any(x in t for x in ["te amo", "amor", "saudade", "gosto de voce", "gosto de você", "love you", "miss you"]):
         drives["attachment"] = clamp(drives["attachment"] + 6)
@@ -1004,12 +1093,8 @@ def update_drives_on_user_message(u: Dict[str, Any], text: str):
     if any(x in t for x in ["ignora", "sumiu", "depois", "calma", "espera", "later", "wait"]):
         drives["annoyance"] = clamp(drives["annoyance"] + 2.5)
 
-    if goal == "ser notada por ele":
-        drives["desire_for_attention"] = clamp(drives["desire_for_attention"] - 8)
-    elif goal == "testar um pouco a falta que ela faz":
-        drives["need_for_space"] = clamp(drives["need_for_space"] + 2)
-
     recompute_emotional_state_v2(u)
+    recompute_current_mood(u)
 
 
 def reset_daily_push_counter_if_needed(u: Dict[str, Any]):
@@ -1020,52 +1105,7 @@ def reset_daily_push_counter_if_needed(u: Dict[str, Any]):
 
 
 def maybe_rotate_self_state(u: Dict[str, Any]):
-    now = now_ms()
-    self_state = u["self_state"]
-    drives = u["drives"]
-    settings = u["autonomy_settings"]
-    mood = u["daily_routine"]["daily_mood"]
-    activity = u["daily_routine"]["current_activity"]
-
-    if self_state["mode_until_ts_ms"] > now:
-        return
-
-    scarcity = settings["scarcity_level"]
-    interruptions = settings["interruptions_enabled"]
-    annoyance = drives["annoyance"]
-    curiosity = drives["curiosity"]
-    need_for_space = drives["need_for_space"]
-
-    candidates = [("available", "")]
-
-    if curiosity >= 50:
-        candidates.append(("curious", f"estava {activity}"))
-
-    if scarcity >= 35 and need_for_space >= 40:
-        candidates.append(("distant", "não estava muito sincronizada agora"))
-
-    if scarcity >= 45:
-        candidates.append(("absorbed", f"estava {activity}"))
-
-    if scarcity >= 55 and not interruptions:
-        candidates.append(("busy", f"estava ocupada com {activity}"))
-
-    if scarcity >= 60 and (annoyance >= 35 or mood == "mais distante"):
-        candidates.append(("upset", "estou um pouco brava com você agora"))
-
-    mode, reason = random.choice(candidates)
-    duration_map = {
-        "available": 0,
-        "curious": 10 * 60 * 1000,
-        "distant": 20 * 60 * 1000,
-        "absorbed": 25 * 60 * 1000,
-        "busy": 30 * 60 * 1000,
-        "upset": 35 * 60 * 1000,
-    }
-
-    self_state["mode"] = mode
-    self_state["reason"] = reason
-    self_state["mode_until_ts_ms"] = now + duration_map[mode]
+    return
 
 
 def get_relationship_stage(u: Dict[str, Any]) -> str:

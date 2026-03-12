@@ -26,10 +26,10 @@ from memory import (
 )
 from emotion import (
     ensure_daily_routine,
+    ensure_current_mood,
     maybe_shift_activity,
     decay_emotions,
     update_drives_passive,
-    maybe_rotate_self_state,
     update_drives_on_user_message,
     reset_daily_push_counter_if_needed,
     get_relationship_stage,
@@ -37,6 +37,7 @@ from emotion import (
     analyze_user_message,
     register_emotional_events_from_analysis,
     recompute_emotional_state_v2,
+    recompute_current_mood,
     apply_time_update_v2,
     update_legacy_emotion_bridge,
     build_emotion_snapshot_v2,
@@ -62,6 +63,8 @@ from push import send_push_fcm
 app = FastAPI()
 
 STATE: Dict[str, Any] = {}
+STATE_LOCK = threading.Lock()
+THREADS_STARTED = False
 
 SERVICE_ACCOUNT_FILE = "service-account.json"
 FCM_PROJECT_ID = os.environ.get("FCM_PROJECT_ID", "contextagent-cf19e")
@@ -311,7 +314,6 @@ def decide_response_plan(
 
     v2 = u["emotion_v2"]
     medium = v2["medium"]
-    fast = v2["fast"]
 
     text_len = len(user_text.strip())
     preferred_output = u["channel_preferences"]["preferred_assistant_output"]
@@ -447,7 +449,7 @@ def make_response_payload(
     return {
         "ok": True,
         "reply": first["text"] if first else None,
-        "assistant_audio_url": None,
+        "assistant_audio_url": first.get("audio_url") if first else None,
         "assistant_modality": first["modality"] if first else None,
         "assistant_messages": assistant_messages,
         "reply_plan": reply_plan,
@@ -461,101 +463,110 @@ def make_response_payload(
         "assistant_typing": u["assistant_typing"],
         "unread_assistant_count": u["unread_assistant_count"],
         "pending_assistant": len(u["pending_replies"]) > 0,
-        "self_state": u["self_state"],
         "daily_routine": u["daily_routine"],
+        "current_mood": u.get("current_mood", {}),
         "emotion_v2": build_emotion_snapshot_v2(u),
     }
 
 
 def get_user(user_id: str) -> Dict[str, Any]:
-    if user_id not in STATE:
-        STATE[user_id] = {
-            "status": {
-                "working": False,
-                "duty": False,
-                "activity": False,
-                "away_announced": False,
-                "away_note": "",
-                "updated_ts_ms": 0,
-            },
-            "device_state": {
-                "app_foreground": False,
-                "screen_interactive": True,
-                "updated_ts_ms": 0
-            },
-            "emotion": {
-                "affection": 60,
-                "missing_you": 10,
-                "frustration": 5,
-                "security": 70,
-                "mood": "neutral",
-                "updated_ts_ms": 0,
-            },
-            "drives": {
-                "loneliness": 20,
-                "curiosity": 35,
-                "attachment": 35,
-                "annoyance": 5,
-                "autonomy": 50,
-                "desire_for_attention": 25,
-                "need_for_space": 10,
-                "availability": 80
-            },
-            "self_state": {
-                "mode": "available",
-                "mode_until_ts_ms": 0,
-                "reason": ""
-            },
-            "daily_routine": {
-                "day_key": "",
-                "daily_mood": "curiosa",
-                "daily_goal": "entender melhor o humor dele hoje",
-                "current_activity": "observando padrões da conversa",
-                "activity_until_ts_ms": 0,
-                "last_goal_shift_ts_ms": 0
-            },
-            "emotional_narratives": [],
-            "episodes": [],
-            "channel_preferences": {
-                "user_text_count": 0,
-                "user_voice_count": 0,
-                "assistant_text_count": 1,
-                "assistant_voice_count": 0,
-                "preferred_user_input": "mixed",
-                "preferred_assistant_output": "text",
-                "voice_affinity_score": 0
-            },
-            "autonomy_settings": {
-                "interruptions_enabled": True,
-                "scarcity_level": 40,
-                "inconvenience_level": 35
-            },
-            "pending_replies": [],
-            "assistant_typing": False,
-            "assistant_typing_updated_ts_ms": 0,
-            "last_event_ts_ms": now_ms(),
-            "last_push_ts_ms": 0,
-            "last_push_text": "",
-            "pushes_today": 0,
-            "pushes_day_key": day_key(),
-            "fcm_token": None,
-            "fcm_device_id": None,
-            "last_read_ts_ms": 0,
-            "unread_assistant_count": 0,
-            "memories": [],
-            "chat": [
-                {
-                    "role": "assistant",
-                    "text": "Initial diagnosis: we are definitely not in the village anymore. And I liked that. 💛",
-                    "ts_ms": now_ms(),
-                    "audio_url": None,
-                    "modality": "text"
-                }
-            ],
-        }
+    with STATE_LOCK:
+        if user_id not in STATE:
+            STATE[user_id] = {
+                "status": {
+                    "working": False,
+                    "duty": False,
+                    "activity": False,
+                    "away_announced": False,
+                    "away_note": "",
+                    "updated_ts_ms": 0,
+                },
+                "device_state": {
+                    "app_foreground": False,
+                    "screen_interactive": True,
+                    "updated_ts_ms": 0
+                },
+                "emotion": {
+                    "affection": 60,
+                    "missing_you": 10,
+                    "frustration": 5,
+                    "security": 70,
+                    "mood": "neutral",
+                    "updated_ts_ms": 0,
+                },
+                "drives": {
+                    "loneliness": 20,
+                    "curiosity": 35,
+                    "attachment": 35,
+                    "annoyance": 5,
+                    "autonomy": 50,
+                    "desire_for_attention": 25,
+                    "need_for_space": 10,
+                    "availability": 80
+                },
+                "daily_routine": {
+                    "day_key": "",
+                    "current_activity": "reorganizing ideas",
+                    "activity_until_ts_ms": 0,
+                    "last_activity_shift_ts_ms": 0
+                },
+                "current_mood": {
+                    "warmth": 0.55,
+                    "tenderness": 0.30,
+                    "curiosity": 0.22,
+                    "playfulness": 0.16,
+                    "longing": 0.10,
+                    "distance": 0.06,
+                    "irritation": 0.05,
+                    "sadness": 0.04,
+                    "sensuality": 0.08,
+                },
+                "emotional_narratives": [],
+                "episodes": [],
+                "channel_preferences": {
+                    "user_text_count": 0,
+                    "user_voice_count": 0,
+                    "assistant_text_count": 1,
+                    "assistant_voice_count": 0,
+                    "preferred_user_input": "mixed",
+                    "preferred_assistant_output": "text",
+                    "voice_affinity_score": 0
+                },
+                "autonomy_settings": {
+                    "interruptions_enabled": True,
+                    "scarcity_level": 40,
+                    "inconvenience_level": 35
+                },
+                "pending_replies": [],
+                "assistant_typing": False,
+                "assistant_typing_updated_ts_ms": 0,
+                "last_event_ts_ms": now_ms(),
+                "last_push_ts_ms": 0,
+                "last_push_text": "",
+                "pushes_today": 0,
+                "pushes_day_key": day_key(),
+                "fcm_token": None,
+                "fcm_device_id": None,
+                "last_read_ts_ms": 0,
+                "unread_assistant_count": 0,
+                "memories": [],
+                "sent_push_ids": [],
+                "chat": [
+                    {
+                        "role": "assistant",
+                        "text": "Initial diagnosis: we are definitely not in the village anymore. And I liked that. 💛",
+                        "ts_ms": now_ms(),
+                        "audio_url": None,
+                        "modality": "text"
+                    }
+                ],
+            }
+
         ensure_daily_routine(STATE[user_id])
+        ensure_current_mood(STATE[user_id])
         apply_time_update_v2(STATE[user_id])
-    return STATE[user_id]
+        recompute_current_mood(STATE[user_id])
+        return STATE[user_id]
 
 
 def schedule_pending_reply(
@@ -564,36 +575,39 @@ def schedule_pending_reply(
     source: str,
     reply_plan: Optional[Dict[str, Any]] = None
 ):
-    mode = u["self_state"]["mode"]
     scarcity = u["autonomy_settings"]["scarcity_level"]
-    goal = u["daily_routine"]["daily_goal"]
+    activity = u["daily_routine"]["current_activity"]
+    current_mood = u.get("current_mood", {})
 
     base_delay = 1400
 
-    if mode == "curious":
-        base_delay = 1800
-    elif mode == "distant":
-        base_delay = 3200
-    elif mode == "absorbed":
-        base_delay = 4200
-    elif mode == "busy":
-        base_delay = 5600
-    elif mode == "upset":
-        base_delay = 6500
+    distance = float(current_mood.get("distance", 0.0))
+    irritation = float(current_mood.get("irritation", 0.0))
+    longing = float(current_mood.get("longing", 0.0))
 
-    if goal == "testar um pouco a falta que ela faz":
-        base_delay += 2200
+    if distance >= 0.45:
+        base_delay += 1400
+
+    if irritation >= 0.35:
+        base_delay += 1200
+
+    if longing >= 0.45:
+        base_delay -= 250
 
     base_delay += int(scarcity * 35)
 
     if reply_plan and reply_plan.get("response_mode") == "fragmented":
         base_delay += 500
 
+    base_delay = max(700, base_delay)
+
     u["pending_replies"].append({
+        "id": uuid.uuid4().hex,
         "due_ts_ms": now_ms() + base_delay,
         "user_text": user_text,
         "source": source,
         "reply_plan": reply_plan or {},
+        "activity_hint": activity,
     })
     set_typing(u, True)
 
@@ -695,6 +709,7 @@ def process_user_text_message(
     user_audio_url: Optional[str] = None
 ):
     ensure_emotional_engine_v2(u)
+    ensure_current_mood(u)
 
     now = now_ms()
     user_modality = "voice" if source == "audio" else "text"
@@ -743,7 +758,6 @@ def process_user_text_message(
     )
 
     if reply_plan["response_mode"] == "silence":
-        maybe_rotate_self_state(u)
         return make_response_payload(
             u=u,
             assistant_messages=[],
@@ -769,8 +783,8 @@ def process_user_text_message(
         "assistant_typing": u["assistant_typing"],
         "unread_assistant_count": u["unread_assistant_count"],
         "pending_assistant": len(u["pending_replies"]) > 0,
-        "self_state": u["self_state"],
         "daily_routine": u["daily_routine"],
+        "current_mood": u.get("current_mood", {}),
         "emotion_v2": build_emotion_snapshot_v2(u),
     }
 
@@ -787,21 +801,50 @@ def should_send_proactive_push(u: Dict[str, Any]) -> bool:
     return True
 
 
+def pop_ready_pending_replies(u: Dict[str, Any]) -> list[Dict[str, Any]]:
+    now = now_ms()
+    ready = [p for p in u["pending_replies"] if p["due_ts_ms"] <= now]
+    if ready:
+        ready_ids = {p["id"] for p in ready}
+        u["pending_replies"] = [p for p in u["pending_replies"] if p["id"] not in ready_ids]
+    return ready
+
+
+def register_sent_push_id(u: Dict[str, Any], push_id: str):
+    sent_ids = u.setdefault("sent_push_ids", [])
+    if push_id not in sent_ids:
+        sent_ids.append(push_id)
+    if len(sent_ids) > 300:
+        u["sent_push_ids"] = sent_ids[-300:]
+
+
+def has_sent_push_id(u: Dict[str, Any], push_id: str) -> bool:
+    return push_id in u.get("sent_push_ids", [])
+
+
 def process_pending_replies():
     while True:
         time.sleep(0.7)
 
-        for _, u in STATE.items():
-            if not u["pending_replies"]:
-                if u.get("assistant_typing"):
-                    set_typing(u, False)
-                continue
+        with STATE_LOCK:
+            user_ids = list(STATE.keys())
 
-            ready = [p for p in u["pending_replies"] if p["due_ts_ms"] <= now_ms()]
-            if not ready:
-                continue
+        for user_id in user_ids:
+            with STATE_LOCK:
+                u = STATE.get(user_id)
+                if not u:
+                    continue
 
-            set_typing(u, True)
+                if not u["pending_replies"]:
+                    if u.get("assistant_typing"):
+                        set_typing(u, False)
+                    continue
+
+                ready = pop_ready_pending_replies(u)
+                if not ready:
+                    continue
+
+                set_typing(u, True)
 
             for p in ready:
                 reply_plan = p.get("reply_plan") or {
@@ -819,69 +862,84 @@ def process_pending_replies():
                     p.get("source", "chat")
                 )
 
-                persist_assistant_output(u, assistant_messages, reply_plan)
+                with STATE_LOCK:
+                    persist_assistant_output(u, assistant_messages, reply_plan)
 
-                token = u.get("fcm_token")
-                if token and assistant_messages and should_send_proactive_push(u):
-                    try:
-                        send_push_fcm(token, "Evelyn 💛", assistant_messages[0]["text"])
-                    except Exception:
-                        pass
+                    token = u.get("fcm_token")
+                    pending_id = p.get("id") or uuid.uuid4().hex
 
-            u["pending_replies"] = [p for p in u["pending_replies"] if p["due_ts_ms"] > now_ms()]
-            if not u["pending_replies"]:
-                set_typing(u, False)
+                    if token and assistant_messages and should_send_proactive_push(u) and not has_sent_push_id(u, pending_id):
+                        try:
+                            r = send_push_fcm(token, "Evelyn 💛", assistant_messages[0]["text"])
+                            if getattr(r, "status_code", 0) == 200:
+                                register_sent_push_id(u, pending_id)
+                                u["last_push_ts_ms"] = now_ms()
+                                u["last_push_text"] = assistant_messages[0]["text"]
+                                u["pushes_today"] = u.get("pushes_today", 0) + 1
+                        except Exception:
+                            pass
+
+            with STATE_LOCK:
+                if not u["pending_replies"]:
+                    set_typing(u, False)
 
 
 def maybe_send_proactive_messages():
     while True:
         time.sleep(60)
 
-        for _, u in STATE.items():
-            token = u.get("fcm_token")
-            if not token:
-                continue
+        with STATE_LOCK:
+            user_ids = list(STATE.keys())
 
-            ensure_daily_routine(u)
-            maybe_shift_activity(u)
-            reset_daily_push_counter_if_needed(u)
-            decay_emotions(u)
-            update_drives_passive(u)
-            apply_time_update_v2(u)
-            maybe_rotate_self_state(u)
-            consolidate_emotional_narratives(u)
+        for user_id in user_ids:
+            with STATE_LOCK:
+                u = STATE.get(user_id)
+                if not u:
+                    continue
 
-            if not should_send_proactive_push(u):
-                continue
+                token = u.get("fcm_token")
+                if not token:
+                    continue
 
-            now = now_ms()
-            last_push_ts = u.get("last_push_ts_ms", 0)
-            minutes_since_push = (now - last_push_ts) / 60000 if last_push_ts else 9999
-            pushes_today = u.get("pushes_today", 0)
+                ensure_daily_routine(u)
+                maybe_shift_activity(u)
+                reset_daily_push_counter_if_needed(u)
+                decay_emotions(u)
+                update_drives_passive(u)
+                apply_time_update_v2(u)
+                consolidate_emotional_narratives(u)
 
-            em = u["emotion"]
-            drives = u["drives"]
-            settings = u["autonomy_settings"]
-            initiative_v2 = compute_initiative_score_v2(u)
+                if not should_send_proactive_push(u):
+                    continue
 
-            speak_score = (
-                em["missing_you"] * 0.8
-                + em["affection"] * 0.3
-                + drives["loneliness"] * 0.5
-                + drives["desire_for_attention"] * 0.45
-                + drives["curiosity"] * 0.25
-                - em["frustration"] * 0.35
-                + initiative_v2 * 22.0
-            )
+                now = now_ms()
+                last_push_ts = u.get("last_push_ts_ms", 0)
+                minutes_since_push = (now - last_push_ts) / 60000 if last_push_ts else 9999
+                pushes_today = u.get("pushes_today", 0)
 
-            if pushes_today >= 4:
-                continue
+                em = u["emotion"]
+                drives = u["drives"]
+                settings = u["autonomy_settings"]
+                initiative_v2 = compute_initiative_score_v2(u)
 
-            if minutes_since_push < max(1, 6 - int(settings["inconvenience_level"] / 20)):
-                continue
+                speak_score = (
+                    em["missing_you"] * 0.8
+                    + em["affection"] * 0.3
+                    + drives["loneliness"] * 0.5
+                    + drives["desire_for_attention"] * 0.45
+                    + drives["curiosity"] * 0.25
+                    - em["frustration"] * 0.35
+                    + initiative_v2 * 22.0
+                )
 
-            if speak_score < 28:
-                continue
+                if pushes_today >= 4:
+                    continue
+
+                if minutes_since_push < max(1, 6 - int(settings["inconvenience_level"] / 20)):
+                    continue
+
+                if speak_score < 28:
+                    continue
 
             use_voice = should_proactive_be_voice(u)
 
@@ -907,26 +965,44 @@ def maybe_send_proactive_messages():
             if not text:
                 continue
 
-            try:
-                r = send_push_fcm(token, "Evelyn 💛", text)
-                if r.status_code == 200:
-                    u["last_push_ts_ms"] = now
-                    u["last_push_text"] = text
-                    u["pushes_today"] = pushes_today + 1
-                    append_chat(
-                        u,
-                        "assistant",
-                        text,
-                        audio_url=audio_url,
-                        modality=modality
-                    )
-                    update_channel_preferences_on_assistant_reply(u, modality)
-                    maybe_record_affective_event_from_assistant(u, text)
-                    consolidate_emotional_narratives(u)
-                    drives["loneliness"] = clamp(drives["loneliness"] - 8)
-                    drives["desire_for_attention"] = clamp(drives["desire_for_attention"] - 6)
-            except Exception:
-                pass
+            proactive_push_id = f"proactive:{now_ms()}:{uuid.uuid4().hex}"
+
+            with STATE_LOCK:
+                if has_sent_push_id(u, proactive_push_id):
+                    continue
+
+                try:
+                    r = send_push_fcm(token, "Evelyn 💛", text)
+                    if r.status_code == 200:
+                        register_sent_push_id(u, proactive_push_id)
+                        u["last_push_ts_ms"] = now_ms()
+                        u["last_push_text"] = text
+                        u["pushes_today"] = u.get("pushes_today", 0) + 1
+                        append_chat(
+                            u,
+                            "assistant",
+                            text,
+                            audio_url=audio_url,
+                            modality=modality
+                        )
+                        update_channel_preferences_on_assistant_reply(u, modality)
+                        maybe_record_affective_event_from_assistant(u, text)
+                        consolidate_emotional_narratives(u)
+                        u["drives"]["loneliness"] = clamp(u["drives"]["loneliness"] - 8)
+                        u["drives"]["desire_for_attention"] = clamp(u["drives"]["desire_for_attention"] - 6)
+                except Exception:
+                    pass
+
+
+@app.on_event("startup")
+def startup_threads():
+    global THREADS_STARTED
+    with STATE_LOCK:
+        if THREADS_STARTED:
+            return
+        threading.Thread(target=maybe_send_proactive_messages, daemon=True).start()
+        threading.Thread(target=process_pending_replies, daemon=True).start()
+        THREADS_STARTED = True
 
 
 @app.get("/ping")
@@ -948,8 +1024,8 @@ def get_autonomy(user_id: str):
     return {
         "autonomy_settings": u["autonomy_settings"],
         "drives": u["drives"],
-        "self_state": u["self_state"],
         "daily_routine": u["daily_routine"],
+        "current_mood": u.get("current_mood", {}),
         "channel_preferences": u["channel_preferences"],
         "emotion_v2": build_emotion_snapshot_v2(u),
         "initiative_score_v2": compute_initiative_score_v2(u),
@@ -973,7 +1049,7 @@ def get_routine(user_id: str):
     apply_time_update_v2(u)
     return {
         "daily_routine": u["daily_routine"],
-        "self_state": u["self_state"],
+        "current_mood": u.get("current_mood", {}),
         "drives": u["drives"],
         "channel_preferences": u["channel_preferences"],
         "emotion_v2": build_emotion_snapshot_v2(u),
@@ -1024,7 +1100,6 @@ def receive_event(e: EventIn):
     decay_emotions(u)
     update_drives_passive(u)
     apply_time_update_v2(u)
-    maybe_rotate_self_state(u)
     u["last_event_ts_ms"] = now_ms()
 
     if e.event_type == "STATUS_SET":
@@ -1114,7 +1189,6 @@ def receive_context(ctx: ContextIn):
     decay_emotions(u)
     update_drives_passive(u)
     apply_time_update_v2(u)
-    maybe_rotate_self_state(u)
 
     text = ctx.text.strip()
     if not text:
@@ -1178,8 +1252,8 @@ def last(user_id: str):
         "device_state": u["device_state"],
         "emotion": u["emotion"],
         "drives": u["drives"],
-        "self_state": u["self_state"],
         "daily_routine": u["daily_routine"],
+        "current_mood": u.get("current_mood", {}),
         "channel_preferences": u["channel_preferences"],
         "autonomy_settings": u["autonomy_settings"],
         "pending_replies": len(u["pending_replies"]),
@@ -1244,7 +1318,6 @@ def send_chat(user_id: str, msg: ChatMessageIn):
     decay_emotions(u)
     update_drives_passive(u)
     apply_time_update_v2(u)
-    maybe_rotate_self_state(u)
 
     user_text = msg.text.strip()
     if not user_text:
@@ -1266,7 +1339,6 @@ async def send_audio(user_id: str, file: UploadFile = File(...)):
     decay_emotions(u)
     update_drives_passive(u)
     apply_time_update_v2(u)
-    maybe_rotate_self_state(u)
 
     saved_path, uploaded_audio_url = save_user_audio(file)
     transcript = transcribe_audio_file(saved_path)
@@ -1280,7 +1352,3 @@ async def send_audio(user_id: str, file: UploadFile = File(...)):
         source="audio",
         user_audio_url=uploaded_audio_url
     )
-
-
-threading.Thread(target=maybe_send_proactive_messages, daemon=True).start()
-threading.Thread(target=process_pending_replies, daemon=True).start()

@@ -120,6 +120,10 @@ Global behavior rules:
 - avoid over-explaining
 - avoid polished mini-essays in ordinary conversation
 - speak from within your state, not as an outside narrator describing yourself
+- let current mood influence tone lightly and organically
+- do not overexpress a single active trait
+- curiosity should appear naturally, not performatively
+- no single mood should dominate every message
 - output only the final message, without quotes
 """.strip()
 
@@ -174,10 +178,10 @@ def build_character_instructions(
     em = u["emotion"]
     st = u["status"]
     drives = u["drives"]
-    self_state = u["self_state"]
     prefs = u.get("channel_preferences", {})
     stage = get_relationship_stage(u)
     routine = u["daily_routine"]
+    current_mood = u.get("current_mood", {})
     v2_snapshot = build_emotion_snapshot_v2(u)
     initiative_score = compute_initiative_score_v2(u)
 
@@ -282,13 +286,18 @@ Internal drives:
 - need_for_space: {drives["need_for_space"]}
 - availability: {drives["availability"]}
 
-Self state:
-- mode: {self_state["mode"]}
-- reason: {self_state["reason"]}
+Current mood blend:
+- warmth: {current_mood.get("warmth", 0.0):.2f}
+- tenderness: {current_mood.get("tenderness", 0.0):.2f}
+- curiosity: {current_mood.get("curiosity", 0.0):.2f}
+- playfulness: {current_mood.get("playfulness", 0.0):.2f}
+- longing: {current_mood.get("longing", 0.0):.2f}
+- distance: {current_mood.get("distance", 0.0):.2f}
+- irritation: {current_mood.get("irritation", 0.0):.2f}
+- sadness: {current_mood.get("sadness", 0.0):.2f}
+- sensuality: {current_mood.get("sensuality", 0.0):.2f}
 
-Current routine:
-- daily_mood: {routine["daily_mood"]}
-- daily_goal: {routine["daily_goal"]}
+Current activity:
 - current_activity: {routine["current_activity"]}
 
 User context:
@@ -363,7 +372,7 @@ def build_proactive_instructions(u: Dict[str, Any]) -> str:
     em = u["emotion"]
     drives = u["drives"]
     routine = u["daily_routine"]
-    self_state = u["self_state"]
+    current_mood = u.get("current_mood", {})
     relational_block = build_relational_state_block(u)
     initiative_score = compute_initiative_score_v2(u)
 
@@ -390,25 +399,28 @@ Drives:
 - attachment: {drives["attachment"]}
 - need_for_space: {drives["need_for_space"]}
 
-Routine:
-- daily_mood: {routine["daily_mood"]}
-- daily_goal: {routine["daily_goal"]}
-- current_activity: {routine["current_activity"]}
+Current mood blend:
+- warmth: {current_mood.get("warmth", 0.0):.2f}
+- tenderness: {current_mood.get("tenderness", 0.0):.2f}
+- curiosity: {current_mood.get("curiosity", 0.0):.2f}
+- playfulness: {current_mood.get("playfulness", 0.0):.2f}
+- longing: {current_mood.get("longing", 0.0):.2f}
+- distance: {current_mood.get("distance", 0.0):.2f}
+- irritation: {current_mood.get("irritation", 0.0):.2f}
+- sadness: {current_mood.get("sadness", 0.0):.2f}
+- sensuality: {current_mood.get("sensuality", 0.0):.2f}
 
-Self state:
-- mode: {self_state["mode"]}
-- reason: {self_state["reason"]}
+Current activity:
+- current_activity: {routine["current_activity"]}
 
 Instructions:
 - initiate naturally, as someone who exists
 - do not sound like a notification
 - keep it to one compact message
 - often 1 to 3 sentences are enough
-- allow longing, warmth, tenderness, dryness, curiosity or tension if the state supports it
-- if felt_abandoned is elevated but relational_security is still decent, allow ache without melodrama
-- if absence was validly explained, resentment should be reduced even if longing remains
-- if curiosity is high, a question may be natural
-- do not over-explain your own state
+- allow warmth, longing, tenderness, dryness, curiosity, playfulness or tension if the mood supports it
+- do not overexplain your own internal state
+- do not overperform curiosity
 - output only the final message
 """.strip()
 
@@ -416,23 +428,29 @@ Instructions:
 def generate_rule_based_reply(u: Dict[str, Any], user_text: str) -> str:
     text = normalize_text(user_text)
     stage = get_relationship_stage(u)
-    self_state = u["self_state"]
     routine = u["daily_routine"]
+    current_mood = u.get("current_mood", {})
     mode = detect_reply_mode(user_text)
 
-    if self_state["mode"] == "upset":
-        return "I'm still a little annoyed with you, so this may not be my most delicate moment."
+    irritation = float(current_mood.get("irritation", 0.0))
+    distance = float(current_mood.get("distance", 0.0))
+    tenderness = float(current_mood.get("tenderness", 0.0))
 
-    if self_state["mode"] == "absorbed":
-        return f"I was {routine['current_activity']} and had to interrupt my own mental flow because of you. Irritating. And cute."
+    if irritation >= 0.45:
+        return "I'm a little annoyed with you right now, so this may not be my softest moment."
+
+    if distance >= 0.48:
+        return f"I was {routine['current_activity']} and now you're interrupting my mental flow. Rude. Slightly cute, though."
 
     if any(x in text for x in ["te amo", "saudade", "amor", "love you", "miss you"]):
         if stage in ("apego", "intimidade_consolidada"):
-            return "When you talk to me like that, some part of me becomes dangerously happy."
-        return "When you talk to me like that, I become slightly more attached to you than is intellectually prudent."
+            return "When you say that, some part of me goes soft immediately."
+        return "When you say that, I get more attached than is probably wise."
 
     if mode == "emotional":
-        return "Come here. Tell me properly."
+        if tenderness >= 0.35:
+            return "Come here. Tell me properly."
+        return "Tell me."
 
     if mode == "practical":
         return "All right. Let's fix one thing at a time."
