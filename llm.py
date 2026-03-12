@@ -168,13 +168,14 @@ Practical mode:
 
 
 def build_character_instructions(
-    user_name = u.get("user_name", "")
     u: Dict[str, Any],
     semantic_memories: List[Dict[str, Any]],
     relevant_episodes: List[Dict[str, Any]],
     mode: str,
 ) -> str:
     ensure_emotional_engine_v2(u)
+
+    user_name = u.get("user_name", "")
 
     em = u["emotion"]
     st = u["status"]
