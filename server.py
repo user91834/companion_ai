@@ -7,6 +7,7 @@ import os
 import uuid
 import shutil
 from pathlib import Path
+import json
 
 import requests
 from openai import OpenAI
@@ -66,6 +67,8 @@ STATE: Dict[str, Any] = {}
 STATE_LOCK = threading.Lock()
 THREADS_STARTED = False
 
+STATE_FILE = "state.json"
+
 SERVICE_ACCOUNT_FILE = "service-account.json"
 FCM_PROJECT_ID = os.environ.get("FCM_PROJECT_ID", "contextagent-cf19e")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-nano")
@@ -89,6 +92,27 @@ app.mount("/media", StaticFiles(directory=str(MEDIA_ROOT)), name="media")
 
 def media_url(subdir: str, filename: str) -> str:
     return f"{PUBLIC_BASE_URL}/media/{subdir}/{filename}"
+
+
+def save_state():
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(STATE, f)
+    except Exception as e:
+        print("STATE SAVE ERROR:", e)
+
+
+def load_state():
+    global STATE
+
+    if not os.path.exists(STATE_FILE):
+        return
+
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            STATE = json.load(f)
+    except Exception as e:
+        print("STATE LOAD ERROR:", e)
 
 
 def analyze_context_to_emotional_events(text: str) -> list[Dict[str, Any]]:
@@ -473,6 +497,7 @@ def get_user(user_id: str) -> Dict[str, Any]:
     with STATE_LOCK:
         if user_id not in STATE:
             STATE[user_id] = {
+                "user_name": "",
                 "status": {
                     "working": False,
                     "duty": False,
@@ -766,6 +791,8 @@ def process_user_text_message(
 
     schedule_pending_reply(u, user_text, source, reply_plan=reply_plan)
 
+    save_state()
+
     return {
         "ok": True,
         "reply": None,
@@ -994,14 +1021,23 @@ def maybe_send_proactive_messages():
                     pass
 
 
+def autosave_loop():
+    while True:
+        time.sleep(20)
+        with STATE_LOCK:
+            save_state()
+
+
 @app.on_event("startup")
 def startup_threads():
     global THREADS_STARTED
+    load_state()
     with STATE_LOCK:
         if THREADS_STARTED:
             return
         threading.Thread(target=maybe_send_proactive_messages, daemon=True).start()
         threading.Thread(target=process_pending_replies, daemon=True).start()
+        threading.Thread(target=autosave_loop, daemon=True).start()
         THREADS_STARTED = True
 
 
@@ -1281,6 +1317,29 @@ def register_token(t: TokenIn):
     u["fcm_device_id"] = t.device_id
     return {"ok": True}
 
+
+@app.post("/set_name/{user_id}")
+def set_user_name(user_id: str, name: str):
+    u = get_user(user_id)
+
+    clean = name.strip()[:80]
+    if clean:
+        u["user_name"] = clean
+
+    save_state()
+
+    return {
+        "ok": True,
+        "user_name": u["user_name"]
+    }
+
+
+@app.get("/name/{user_id}")
+def get_user_name(user_id: str):
+    u = get_user(user_id)
+    return {
+        "user_name": u.get("user_name", "")
+    }
 
 @app.get("/memories/{user_id}")
 def get_memories(user_id: str):

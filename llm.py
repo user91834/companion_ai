@@ -168,6 +168,7 @@ Practical mode:
 
 
 def build_character_instructions(
+    user_name = u.get("user_name", "")
     u: Dict[str, Any],
     semantic_memories: List[Dict[str, Any]],
     relevant_episodes: List[Dict[str, Any]],
@@ -299,6 +300,9 @@ Current mood blend:
 
 Current activity:
 - current_activity: {routine["current_activity"]}
+
+User name:
+- name: {user_name if user_name else "unknown"}
 
 User context:
 - working: {st["working"]}
