@@ -816,9 +816,10 @@ def process_user_text_message(
     }
 
 
-def should_send_proactive_push(state: Dict[str, Any]) -> bool:
+def should_send_proactive_push(u: Dict[str, Any]) -> bool:
 
-    app_foreground = bool(state.get("app_foreground", False))
+    device = u.get("device_state", {})
+    app_foreground = bool(device.get("app_foreground", False))
 
     if app_foreground:
         return False
@@ -911,100 +912,127 @@ def process_pending_replies():
 
 def maybe_send_proactive_messages():
     while True:
+        time.sleep(20)
         try:
-            time.sleep(20)
-            now = now_ms()
+            with STATE_LOCK:
+                user_ids = list(STATE.keys())
 
-            for user_id, u in USERS.items():
+            for user_id in user_ids:
+                with STATE_LOCK:
+                    u = STATE.get(user_id)
+                    if not u:
+                        continue
 
-                if not u.get("fcm_token"):
-                    continue
+                    if not u.get("fcm_token"):
+                        continue
 
-                if not should_send_proactive_push(u):
-                    continue
+                    ensure_daily_routine(u)
+                    maybe_shift_activity(u)
+                    decay_emotions(u)
+                    update_drives_passive(u)
+                    apply_time_update_v2(u)
+                    consolidate_emotional_narratives(u)
+                    ensure_current_mood(u)
+                    ensure_emotional_engine_v2(u)
 
-                ensure_daily_routine(u)
-                ensure_current_mood(u)
-                ensure_emotional_engine_v2(u)
+                    if not should_send_proactive_push(u):
+                        continue
 
-                em = u["emotion"]
-                drives = u["drives"]
-                settings = u["autonomy_settings"]
+                    now = now_ms()
+                    last_push_ts = u.get("last_push_ts_ms", 0)
+                    minutes_since_push = (now - last_push_ts) / 60000 if last_push_ts else 9999
 
-                last_push_ts = u.get("last_push_ts_ms", 0)
-                minutes_since_push = (now - last_push_ts) / 60000 if last_push_ts else 9999
+                    em = u["emotion"]
+                    drives = u["drives"]
+                    settings = u["autonomy_settings"]
 
-                initiative_v2 = compute_initiative_score_v2(u)
+                    initiative_v2 = compute_initiative_score_v2(u)
 
-                speak_score = (
-                    em["missing_you"] * 0.8
-                    + em["affection"] * 0.3
-                    + drives["loneliness"] * 0.5
-                    + drives["desire_for_attention"] * 0.45
-                    + drives["curiosity"] * 0.25
-                    - em["frustration"] * 0.35
-                    + initiative_v2 * 22.0
-                )
-
-                # -----------------------------
-                # ESTADO EMOCIONAL INTENSO
-                # -----------------------------
-
-                high_attachment_state = (
-                    em["missing_you"] >= 55
-                    or drives["loneliness"] >= 60
-                    or drives["desire_for_attention"] >= 60
-                    or em["affection"] >= 75
-                )
-
-                upset_state = em["frustration"] >= 45
-
-                # -----------------------------
-                # INTERVALO EMOCIONAL
-                # -----------------------------
-
-                if high_attachment_state and upset_state:
-                    min_interval = 1  # pessoa irritada + carente manda várias mensagens
-                elif high_attachment_state:
-                    min_interval = 2
-                else:
-                    min_interval = max(3, 6 - int(settings["inconvenience_level"] / 20))
-
-                if minutes_since_push < min_interval:
-                    continue
-
-                if speak_score < 28:
-                    continue
-
-                # -----------------------------
-                # GERAR MENSAGEM
-                # -----------------------------
-
-                message = generate_proactive_message(u)
-
-                if not message:
-                    continue
-
-                msg_obj = {
-                    "id": str(uuid.uuid4()),
-                    "role": "assistant",
-                    "text": message,
-                    "ts_ms": now,
-                }
-
-                u["assistant_messages"].append(msg_obj)
-
-                try:
-                    send_push_notification(
-                        token=u["fcm_token"],
-                        title=CHARACTER_PROFILE["name"],
-                        body=message
+                    speak_score = (
+                        em["missing_you"] * 0.8
+                        + em["affection"] * 0.3
+                        + drives["loneliness"] * 0.5
+                        + drives["desire_for_attention"] * 0.45
+                        + drives["curiosity"] * 0.25
+                        - em["frustration"] * 0.35
+                        + initiative_v2 * 22.0
                     )
 
-                    u["last_push_ts_ms"] = now
+                    high_attachment_state = (
+                        em["missing_you"] >= 55
+                        or drives["loneliness"] >= 60
+                        or drives["desire_for_attention"] >= 60
+                        or em["affection"] >= 75
+                    )
 
-                except Exception as e:
-                    print("Push error:", e)
+                    upset_state = em["frustration"] >= 45
+
+                    if high_attachment_state and upset_state:
+                        min_interval = 1
+                    elif high_attachment_state:
+                        min_interval = 2
+                    else:
+                        min_interval = max(3, 6 - int(settings["inconvenience_level"] / 20))
+
+                    if minutes_since_push < min_interval:
+                        continue
+
+                    if speak_score < 28:
+                        continue
+
+                    use_voice = should_proactive_be_voice(u)
+
+                if use_voice:
+                    text = generate_llm_proactive_voice_message(
+                        u,
+                        OPENAI_ENABLED,
+                        openai_client,
+                        OPENAI_MODEL
+                    )
+                    audio_url = synthesize_speech(text) if text else None
+                    modality = "voice" if audio_url else "text"
+                else:
+                    text = generate_llm_proactive_message(
+                        u,
+                        OPENAI_ENABLED,
+                        openai_client,
+                        OPENAI_MODEL
+                    )
+                    audio_url = None
+                    modality = "text"
+
+                if not text:
+                    continue
+
+                proactive_push_id = f"proactive:{now_ms()}:{uuid.uuid4().hex}"
+
+                with STATE_LOCK:
+                    u = STATE.get(user_id)
+                    if not u:
+                        continue
+
+                    if has_sent_push_id(u, proactive_push_id):
+                        continue
+
+                    r = send_push_fcm(u["fcm_token"], "Evelyn 💛", text)
+                    if r.status_code != 200:
+                        continue
+
+                    register_sent_push_id(u, proactive_push_id)
+                    u["last_push_ts_ms"] = now_ms()
+                    u["last_push_text"] = text
+                    append_chat(
+                        u,
+                        "assistant",
+                        text,
+                        audio_url=audio_url,
+                        modality=modality
+                    )
+                    update_channel_preferences_on_assistant_reply(u, modality)
+                    maybe_record_affective_event_from_assistant(u, text)
+                    consolidate_emotional_narratives(u)
+                    u["drives"]["loneliness"] = clamp(u["drives"]["loneliness"] - 8)
+                    u["drives"]["desire_for_attention"] = clamp(u["drives"]["desire_for_attention"] - 6)
 
         except Exception as e:
             print("Proactive loop error:", e)
