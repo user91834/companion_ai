@@ -24,6 +24,10 @@ from memory import (
     get_semantic_memories,
     infer_tags,
     get_relevant_episodes,
+    get_all_memories,
+    get_all_episodes,
+    get_memory_count,
+    get_episode_count,
 )
 from emotion import (
     ensure_daily_routine,
@@ -60,6 +64,7 @@ from llm import (
     should_proactive_be_voice,
 )
 from push import send_push_fcm
+from database import init_db, test_connection, db_available
 
 app = FastAPI()
 
@@ -283,6 +288,22 @@ def latest_unread_preview(u: Dict[str, Any]) -> str:
     return ""
 
 
+def current_memories(u: Dict[str, Any], limit: Optional[int] = None):
+    return get_all_memories(u, limit=limit)
+
+
+def current_episodes(u: Dict[str, Any], limit: Optional[int] = None):
+    return get_all_episodes(u, limit=limit)
+
+
+def current_memory_count(u: Dict[str, Any]) -> int:
+    return get_memory_count(u)
+
+
+def current_episode_count(u: Dict[str, Any]) -> int:
+    return get_episode_count(u)
+
+
 def set_typing(u: Dict[str, Any], is_typing: bool):
     u["assistant_typing"] = is_typing
     u["assistant_typing_updated_ts_ms"] = now_ms()
@@ -483,8 +504,8 @@ def make_response_payload(
         "messages": u["chat"],
         "llm_enabled": OPENAI_ENABLED,
         "model": OPENAI_MODEL,
-        "memory_count": len(u["memories"]),
-        "episode_count": len(u["episodes"]),
+        "memory_count": current_memory_count(u),
+        "episode_count": current_episode_count(u),
         "relationship_stage": get_relationship_stage(u),
         "channel_preferences": u["channel_preferences"],
         "assistant_typing": u["assistant_typing"],
@@ -808,8 +829,8 @@ def process_user_text_message(
         "messages": u["chat"],
         "llm_enabled": OPENAI_ENABLED,
         "model": OPENAI_MODEL,
-        "memory_count": len(u["memories"]),
-        "episode_count": len(u["episodes"]),
+        "memory_count": current_memory_count(u),
+        "episode_count": current_episode_count(u),
         "relationship_stage": get_relationship_stage(u),
         "channel_preferences": u["channel_preferences"],
         "assistant_typing": u["assistant_typing"],
@@ -1080,6 +1101,7 @@ def autosave_loop():
 def startup_threads():
     global THREADS_STARTED
     load_state()
+    init_db()
     with STATE_LOCK:
         if THREADS_STARTED:
             return
@@ -1100,6 +1122,15 @@ def ping():
         "character_name": CHARACTER_PROFILE["name"],
         "public_base_url": PUBLIC_BASE_URL
     }
+
+
+@app.get("/test-db")
+def test_db():
+    if not db_available():
+        return {"ok": False, "error": "DATABASE_URL not configured"}
+
+    result = test_connection()
+    return {"ok": True, "result": list(result) if result else None}
 
 
 @app.get("/autonomy/{user_id}")
@@ -1173,7 +1204,7 @@ def memory_search(user_id: str, q: str = Query(default="")):
 @app.get("/episodes/{user_id}")
 def get_episodes(user_id: str, q: str = Query(default="")):
     u = get_user(user_id)
-    episodes = get_relevant_episodes(u, q, limit=12) if q else u["episodes"][-12:]
+    episodes = get_relevant_episodes(u, q, limit=12) if q else current_episodes(u, limit=12)
     return {"query": q, "count": len(episodes), "episodes": episodes}
 
 
@@ -1313,8 +1344,8 @@ def receive_context(ctx: ContextIn):
     return {
         "ok": True,
         "context_saved": text,
-        "episode_count": len(u["episodes"]),
-        "memory_count": len(u["memories"]),
+        "episode_count": current_episode_count(u),
+        "memory_count": current_memory_count(u),
         "emotion_v2": build_emotion_snapshot_v2(u),
     }
 
@@ -1323,8 +1354,13 @@ def receive_context(ctx: ContextIn):
 def state(user_id: str):
     u = get_user(user_id)
     apply_time_update_v2(u)
+
+    state_payload = dict(u)
+    state_payload["memories"] = current_memories(u)
+    state_payload["episodes"] = current_episodes(u)
+
     return {
-        **u,
+        **state_payload,
         "relationship_stage": get_relationship_stage(u),
         "emotion_v2": build_emotion_snapshot_v2(u),
         "initiative_score_v2": compute_initiative_score_v2(u),
@@ -1352,8 +1388,8 @@ def last(user_id: str):
         "pushes_today": u["pushes_today"],
         "pushes_day_key": u["pushes_day_key"],
         "chat_count": len(u["chat"]),
-        "memory_count": len(u["memories"]),
-        "episode_count": len(u["episodes"]),
+        "memory_count": current_memory_count(u),
+        "episode_count": current_episode_count(u),
         "narrative_count": len(u["emotional_narratives"]),
         "unread_assistant_count": u["unread_assistant_count"],
         "relationship_stage": get_relationship_stage(u),
@@ -1398,7 +1434,8 @@ def get_user_name(user_id: str):
 @app.get("/memories/{user_id}")
 def get_memories(user_id: str):
     u = get_user(user_id)
-    return {"count": len(u["memories"]), "memories": u["memories"]}
+    memories = current_memories(u)
+    return {"count": len(memories), "memories": memories}
 
 
 @app.post("/memories/{user_id}")
@@ -1407,7 +1444,9 @@ def add_memory_endpoint(user_id: str, mem: MemoryIn):
     add_memory(u, mem.text, kind=mem.kind or "fact")
     consolidate_emotional_narratives(u)
     save_state()
-    return {"ok": True, "count": len(u["memories"]), "memories": u["memories"]}
+
+    memories = current_memories(u)
+    return {"ok": True, "count": len(memories), "memories": memories}
 
 
 @app.get("/chat/{user_id}")

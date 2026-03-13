@@ -1,7 +1,12 @@
 from __future__ import annotations
 
-from typing import Dict, Any, List
+import json
+from typing import Dict, Any, List, Optional
+
+from sqlalchemy import text
+
 from utils import now_ms, normalize_text, clamp
+from database import engine, db_available
 
 
 MAX_MEMORIES = 220
@@ -48,8 +53,8 @@ def infer_tags(text: str) -> List[str]:
 
 
 def _memory_score(m: Dict[str, Any], query_tokens: List[str]) -> float:
-    text = normalize_text(m.get("text", ""))
-    mem_tokens = set(_tokenize(text))
+    text_value = normalize_text(m.get("text", ""))
+    mem_tokens = set(_tokenize(text_value))
     overlap = len(mem_tokens.intersection(query_tokens))
 
     importance = float(m.get("importance", 3))
@@ -72,6 +77,275 @@ def _episode_score(ep: Dict[str, Any], query_tokens: List[str]) -> float:
     return overlap * 4.0 + importance * 1.0 + relationship_bonus + recency * 0.1
 
 
+def _ensure_user_memory_state(u: Dict[str, Any]):
+    if "memories" not in u or not isinstance(u["memories"], list):
+        u["memories"] = []
+    if "episodes" not in u or not isinstance(u["episodes"], list):
+        u["episodes"] = []
+
+
+def _db_insert_memory(item: Dict[str, Any]):
+    if not db_available():
+        return
+
+    sql = text("""
+        INSERT INTO memories (
+            text,
+            kind,
+            tags,
+            importance,
+            valence,
+            intensity,
+            pinned,
+            meta,
+            ts_ms
+        )
+        VALUES (
+            :text,
+            :kind,
+            CAST(:tags AS jsonb),
+            :importance,
+            :valence,
+            :intensity,
+            :pinned,
+            CAST(:meta AS jsonb),
+            :ts_ms
+        )
+    """)
+
+    with engine.begin() as conn:
+        conn.execute(
+            sql,
+            {
+                "text": item.get("text", ""),
+                "kind": item.get("kind", "fact"),
+                "tags": json.dumps(item.get("tags", [])),
+                "importance": int(item.get("importance", 3)),
+                "valence": item.get("valence", "mixed"),
+                "intensity": int(item.get("intensity", 50)),
+                "pinned": bool(item.get("pinned", False)),
+                "meta": json.dumps(item.get("meta", {})),
+                "ts_ms": int(item.get("ts_ms", now_ms())),
+            },
+        )
+
+
+def _db_update_existing_memory(existing_id: int, item: Dict[str, Any]):
+    if not db_available():
+        return
+
+    sql = text("""
+        UPDATE memories
+        SET
+            tags = CAST(:tags AS jsonb),
+            importance = :importance,
+            intensity = :intensity,
+            valence = :valence,
+            pinned = :pinned,
+            meta = CAST(:meta AS jsonb),
+            ts_ms = :ts_ms
+        WHERE id = :id
+    """)
+
+    with engine.begin() as conn:
+        conn.execute(
+            sql,
+            {
+                "id": existing_id,
+                "tags": json.dumps(item.get("tags", [])),
+                "importance": int(item.get("importance", 3)),
+                "intensity": int(item.get("intensity", 50)),
+                "valence": item.get("valence", "mixed"),
+                "pinned": bool(item.get("pinned", False)),
+                "meta": json.dumps(item.get("meta", {})),
+                "ts_ms": int(item.get("ts_ms", now_ms())),
+            },
+        )
+
+
+def _db_find_recent_duplicate_memory(norm_text: str, kind: Optional[str] = None, limit: int = 60) -> Optional[Dict[str, Any]]:
+    if not db_available():
+        return None
+
+    sql = text(f"""
+        SELECT id, text, kind, tags, importance, valence, intensity, pinned, meta, ts_ms
+        FROM memories
+        {"WHERE kind = :kind" if kind else ""}
+        ORDER BY ts_ms DESC
+        LIMIT :limit
+    """)
+
+    params = {"limit": limit}
+    if kind:
+        params["kind"] = kind
+
+    with engine.begin() as conn:
+        rows = conn.execute(sql, params).mappings().all()
+
+    for row in rows:
+        if normalize_text(row.get("text", "")) == norm_text:
+            item = dict(row)
+            item["tags"] = item.get("tags") or []
+            item["meta"] = item.get("meta") or {}
+            return item
+
+    return None
+
+
+def _db_insert_episode(item: Dict[str, Any]):
+    if not db_available():
+        return
+
+    sql = text("""
+        INSERT INTO episodes (
+            episode_type,
+            summary,
+            details,
+            tags,
+            importance,
+            ts_ms
+        )
+        VALUES (
+            :episode_type,
+            :summary,
+            CAST(:details AS jsonb),
+            CAST(:tags AS jsonb),
+            :importance,
+            :ts_ms
+        )
+    """)
+
+    with engine.begin() as conn:
+        conn.execute(
+            sql,
+            {
+                "episode_type": item.get("type", "general"),
+                "summary": item.get("summary", ""),
+                "details": json.dumps(item.get("details", {})),
+                "tags": json.dumps(item.get("tags", [])),
+                "importance": int(item.get("importance", 5)),
+                "ts_ms": int(item.get("ts_ms", now_ms())),
+            },
+        )
+
+
+def _db_load_memories(limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    if not db_available():
+        return []
+
+    sql = """
+        SELECT id, text, kind, tags, importance, valence, intensity, pinned, meta, ts_ms
+        FROM memories
+        ORDER BY ts_ms DESC
+    """
+    params: Dict[str, Any] = {}
+
+    if limit is not None:
+        sql += " LIMIT :limit"
+        params["limit"] = limit
+
+    with engine.begin() as conn:
+        rows = conn.execute(text(sql), params).mappings().all()
+
+    result: List[Dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item["tags"] = item.get("tags") or []
+        item["meta"] = item.get("meta") or {}
+        item.pop("id", None)
+        result.append(item)
+
+    return result
+
+
+def _db_load_episodes(limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    if not db_available():
+        return []
+
+    sql = """
+        SELECT id, episode_type, summary, details, tags, importance, ts_ms
+        FROM episodes
+        ORDER BY ts_ms DESC
+    """
+    params: Dict[str, Any] = {}
+
+    if limit is not None:
+        sql += " LIMIT :limit"
+        params["limit"] = limit
+
+    with engine.begin() as conn:
+        rows = conn.execute(text(sql), params).mappings().all()
+
+    result: List[Dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        converted = {
+            "type": item.get("episode_type", "general"),
+            "summary": item.get("summary", ""),
+            "details": item.get("details") or {},
+            "tags": item.get("tags") or [],
+            "importance": item.get("importance", 5),
+            "ts_ms": item.get("ts_ms", 0),
+        }
+        result.append(converted)
+
+    return result
+
+
+def _db_trim_memories():
+    if not db_available():
+        return
+
+    sql = text("""
+        DELETE FROM memories
+        WHERE id IN (
+            SELECT id
+            FROM memories
+            ORDER BY
+                pinned DESC,
+                importance DESC,
+                intensity DESC,
+                ts_ms DESC
+            OFFSET :keep_count
+        )
+    """)
+
+    with engine.begin() as conn:
+        conn.execute(sql, {"keep_count": MAX_MEMORIES})
+
+
+def _db_trim_episodes():
+    if not db_available():
+        return
+
+    sql = text("""
+        DELETE FROM episodes
+        WHERE id IN (
+            SELECT id
+            FROM episodes
+            ORDER BY importance DESC, ts_ms DESC
+            OFFSET :keep_count
+        )
+    """)
+
+    with engine.begin() as conn:
+        conn.execute(sql, {"keep_count": MAX_EPISODES})
+
+
+def _get_memory_source(u: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if db_available():
+        return _db_load_memories()
+    _ensure_user_memory_state(u)
+    return u["memories"]
+
+
+def _get_episode_source(u: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if db_available():
+        return _db_load_episodes()
+    _ensure_user_memory_state(u)
+    return u["episodes"]
+
+
 def add_memory(
     u: Dict[str, Any],
     text: str,
@@ -86,6 +360,8 @@ def add_memory(
     if not text or not text.strip():
         return
 
+    _ensure_user_memory_state(u)
+
     item = {
         "text": text.strip(),
         "kind": kind,
@@ -94,10 +370,35 @@ def add_memory(
         "valence": valence,
         "intensity": int(max(0, min(100, intensity))),
         "pinned": pinned,
+        "meta": {},
         "ts_ms": now_ms(),
     }
 
     norm = normalize_text(item["text"])
+
+    if db_available():
+        existing = _db_find_recent_duplicate_memory(norm, kind=None, limit=60)
+        if existing:
+            existing["ts_ms"] = now_ms()
+            existing["importance"] = max(existing.get("importance", 3), item["importance"])
+            existing["intensity"] = max(existing.get("intensity", 50), item["intensity"])
+            existing["valence"] = item["valence"] or existing.get("valence", "mixed")
+            existing["pinned"] = bool(existing.get("pinned", False) or item["pinned"])
+
+            existing_tags = existing.get("tags", []) or []
+            for tag in item["tags"]:
+                if tag not in existing_tags:
+                    existing_tags.append(tag)
+            existing["tags"] = existing_tags
+
+            existing_meta = existing.get("meta", {}) or {}
+            _db_update_existing_memory(existing_id=existing["id"], item={**existing, "meta": existing_meta})
+            return
+
+        _db_insert_memory(item)
+        _db_trim_memories()
+        return
+
     for m in reversed(u["memories"][-40:]):
         if normalize_text(m.get("text", "")) == norm:
             m["ts_ms"] = now_ms()
@@ -127,6 +428,8 @@ def add_affective_memory(
     if not text or not text.strip():
         return
 
+    _ensure_user_memory_state(u)
+
     item = {
         "text": text.strip(),
         "kind": "affective",
@@ -140,6 +443,32 @@ def add_affective_memory(
     }
 
     norm = normalize_text(item["text"])
+
+    if db_available():
+        existing = _db_find_recent_duplicate_memory(norm, kind="affective", limit=80)
+        if existing:
+            existing["ts_ms"] = now_ms()
+            existing["importance"] = max(existing.get("importance", 3), item["importance"])
+            existing["intensity"] = max(existing.get("intensity", 50), item["intensity"])
+
+            existing_tags = existing.get("tags", []) or []
+            for tag in item["tags"]:
+                if tag not in existing_tags:
+                    existing_tags.append(tag)
+            existing["tags"] = existing_tags
+
+            existing_meta = existing.get("meta", {}) or {}
+            incoming_meta = item.get("meta", {}) or {}
+            existing_meta.update(incoming_meta)
+            existing["meta"] = existing_meta
+
+            _db_update_existing_memory(existing_id=existing["id"], item=existing)
+            return
+
+        _db_insert_memory(item)
+        _db_trim_memories()
+        return
+
     for m in reversed(u["memories"][-50:]):
         if normalize_text(m.get("text", "")) == norm and m.get("kind") == "affective":
             m["ts_ms"] = now_ms()
@@ -289,6 +618,11 @@ def add_episode(
     tags: List[str] | None = None,
     importance: int = 5,
 ):
+    if not summary or not summary.strip():
+        return
+
+    _ensure_user_memory_state(u)
+
     item = {
         "type": episode_type,
         "summary": summary.strip(),
@@ -297,6 +631,12 @@ def add_episode(
         "importance": int(max(1, min(10, importance))),
         "ts_ms": now_ms(),
     }
+
+    if db_available():
+        _db_insert_episode(item)
+        _db_trim_episodes()
+        return
+
     u["episodes"].append(item)
 
     if len(u["episodes"]) > MAX_EPISODES:
@@ -340,12 +680,14 @@ def extract_memories_from_user_text(text: str) -> List[str]:
 
 
 def get_semantic_memories(u: Dict[str, Any], query: str, limit: int = 8) -> List[Dict[str, Any]]:
+    memories = _get_memory_source(u)
     tokens = _tokenize(query)
+
     if not tokens:
-        return sorted(u["memories"], key=lambda m: (m.get("importance", 3), m.get("ts_ms", 0)), reverse=True)[:limit]
+        return sorted(memories, key=lambda m: (m.get("importance", 3), m.get("ts_ms", 0)), reverse=True)[:limit]
 
     scored = []
-    for m in u["memories"]:
+    for m in memories:
         score = _memory_score(m, tokens)
         if score > 0:
             scored.append((score, m))
@@ -355,7 +697,8 @@ def get_semantic_memories(u: Dict[str, Any], query: str, limit: int = 8) -> List
 
 
 def get_recent_affective_memories(u: Dict[str, Any], limit: int = 6) -> List[Dict[str, Any]]:
-    items = [m for m in u["memories"] if m.get("kind") == "affective"]
+    memories = _get_memory_source(u)
+    items = [m for m in memories if m.get("kind") == "affective"]
     items = sorted(
         items,
         key=lambda m: (m.get("importance", 3), m.get("intensity", 50), m.get("ts_ms", 0)),
@@ -365,15 +708,53 @@ def get_recent_affective_memories(u: Dict[str, Any], limit: int = 6) -> List[Dic
 
 
 def get_relevant_episodes(u: Dict[str, Any], query: str, limit: int = 8) -> List[Dict[str, Any]]:
+    episodes = _get_episode_source(u)
     tokens = _tokenize(query)
+
     if not tokens:
-        return sorted(u["episodes"], key=lambda ep: (ep.get("importance", 5), ep.get("ts_ms", 0)), reverse=True)[:limit]
+        return sorted(episodes, key=lambda ep: (ep.get("importance", 5), ep.get("ts_ms", 0)), reverse=True)[:limit]
 
     scored = []
-    for ep in u["episodes"]:
+    for ep in episodes:
         score = _episode_score(ep, tokens)
         if score > 0:
             scored.append((score, ep))
 
     scored.sort(key=lambda x: x[0], reverse=True)
     return [ep for _, ep in scored[:limit]]
+
+
+def get_all_memories(u: Dict[str, Any], limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    if db_available():
+        items = _db_load_memories(limit=limit)
+        return list(reversed(items))
+    _ensure_user_memory_state(u)
+    return u["memories"][:] if limit is None else u["memories"][-limit:]
+
+
+def get_all_episodes(u: Dict[str, Any], limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    if db_available():
+        items = _db_load_episodes(limit=limit)
+        return list(reversed(items))
+    _ensure_user_memory_state(u)
+    return u["episodes"][:] if limit is None else u["episodes"][-limit:]
+
+
+def get_memory_count(u: Dict[str, Any]) -> int:
+    if db_available():
+        sql = text("SELECT COUNT(*) AS count FROM memories")
+        with engine.begin() as conn:
+            row = conn.execute(sql).mappings().first()
+        return int(row["count"]) if row else 0
+    _ensure_user_memory_state(u)
+    return len(u["memories"])
+
+
+def get_episode_count(u: Dict[str, Any]) -> int:
+    if db_available():
+        sql = text("SELECT COUNT(*) AS count FROM episodes")
+        with engine.begin() as conn:
+            row = conn.execute(sql).mappings().first()
+        return int(row["count"]) if row else 0
+    _ensure_user_memory_state(u)
+    return len(u["episodes"])
