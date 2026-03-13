@@ -67,12 +67,8 @@ STATE: Dict[str, Any] = {}
 STATE_LOCK = threading.Lock()
 THREADS_STARTED = False
 
-STATE_FILE = "state.json"
-
-SERVICE_ACCOUNT_FILE = "service-account.json"
 FCM_PROJECT_ID = os.environ.get("FCM_PROJECT_ID", "contextagent-cf19e")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-nano")
-
 OPENAI_ENABLED = bool(os.environ.get("OPENAI_API_KEY"))
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_ENABLED else None
@@ -80,7 +76,12 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_ENABLED else None
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL") or RENDER_EXTERNAL_URL
 
-MEDIA_ROOT = Path("media")
+DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+STATE_FILE = DATA_DIR / "state.json"
+
+MEDIA_ROOT = DATA_DIR / "media"
 USER_AUDIO_DIR = MEDIA_ROOT / "user"
 ASSISTANT_AUDIO_DIR = MEDIA_ROOT / "assistant"
 
@@ -96,8 +97,10 @@ def media_url(subdir: str, filename: str) -> str:
 
 def save_state():
     try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(STATE, f)
+        tmp_file = STATE_FILE.with_suffix(".tmp")
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(STATE, f, ensure_ascii=False)
+        os.replace(tmp_file, STATE_FILE)
     except Exception as e:
         print("STATE SAVE ERROR:", e)
 
@@ -105,7 +108,7 @@ def save_state():
 def load_state():
     global STATE
 
-    if not os.path.exists(STATE_FILE):
+    if not STATE_FILE.exists():
         return
 
     try:
@@ -586,6 +589,7 @@ def get_user(user_id: str) -> Dict[str, Any]:
                     }
                 ],
             }
+            save_state()
 
         ensure_daily_routine(STATE[user_id])
         ensure_current_mood(STATE[user_id])
@@ -783,6 +787,7 @@ def process_user_text_message(
     )
 
     if reply_plan["response_mode"] == "silence":
+        save_state()
         return make_response_payload(
             u=u,
             assistant_messages=[],
@@ -898,6 +903,7 @@ def process_pending_replies():
                         continue
 
                     persist_assistant_output(u, assistant_messages, reply_plan)
+                    save_state()
 
                     token = u.get("fcm_token")
                     pending_id = p.get("id") or uuid.uuid4().hex
@@ -910,6 +916,7 @@ def process_pending_replies():
                                 u["last_push_ts_ms"] = now_ms()
                                 u["last_push_text"] = assistant_messages[0]["text"]
                                 u["pushes_today"] = u.get("pushes_today", 0) + 1
+                                save_state()
                             else:
                                 print("PENDING PUSH NON-200:", getattr(r, "status_code", None), getattr(r, "text", "")[:300])
                         except Exception as e:
@@ -1056,7 +1063,7 @@ def maybe_send_proactive_messages():
                     consolidate_emotional_narratives(u)
                     u["drives"]["loneliness"] = clamp(u["drives"]["loneliness"] - 8)
                     u["drives"]["desire_for_attention"] = clamp(u["drives"]["desire_for_attention"] - 6)
-
+                    save_state()
 
         except Exception as e:
             print("Proactive loop error:", e)
@@ -1115,6 +1122,7 @@ def set_autonomy(user_id: str, data: AutonomyIn):
     u["autonomy_settings"]["interruptions_enabled"] = data.interruptions_enabled
     u["autonomy_settings"]["scarcity_level"] = clamp(data.scarcity_level)
     u["autonomy_settings"]["inconvenience_level"] = clamp(data.inconvenience_level)
+    save_state()
     return {"ok": True, "autonomy_settings": u["autonomy_settings"]}
 
 
@@ -1255,6 +1263,7 @@ def receive_event(e: EventIn):
         ds["screen_interactive"] = bool(e.payload.get("screen_interactive", ds["screen_interactive"]))
         ds["updated_ts_ms"] = e.ts_ms
 
+    save_state()
     return {"ok": True}
 
 
@@ -1298,6 +1307,8 @@ def receive_context(ctx: ContextIn):
     recompute_emotional_state_v2(u)
     update_legacy_emotion_bridge(u)
     consolidate_emotional_narratives(u)
+
+    save_state()
 
     return {
         "ok": True,
@@ -1356,6 +1367,7 @@ def register_token(t: TokenIn):
     u = get_user(t.user_id)
     u["fcm_token"] = t.fcm_token
     u["fcm_device_id"] = t.device_id
+    save_state()
     return {"ok": True}
 
 
@@ -1394,6 +1406,7 @@ def add_memory_endpoint(user_id: str, mem: MemoryIn):
     u = get_user(user_id)
     add_memory(u, mem.text, kind=mem.kind or "fact")
     consolidate_emotional_narratives(u)
+    save_state()
     return {"ok": True, "count": len(u["memories"]), "memories": u["memories"]}
 
 
@@ -1401,6 +1414,7 @@ def add_memory_endpoint(user_id: str, mem: MemoryIn):
 def get_chat(user_id: str):
     u = get_user(user_id)
     mark_chat_read(u)
+    save_state()
     return {
         "messages": u["chat"],
         "unread_assistant_count": u["unread_assistant_count"],
