@@ -5,3 +5,5 @@ requests
 openai
 google-auth
 python-multipart
+psycopg2-binary
+sqlalchemy
