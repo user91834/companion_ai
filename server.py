@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Query, UploadFile, File
 from fastapi.staticfiles import StaticFiles
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 import threading
 import time
 import os
@@ -8,17 +8,25 @@ import uuid
 import shutil
 from pathlib import Path
 import json
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import requests
 from openai import OpenAI
 
 from character_profile import CHARACTER_PROFILE
-from models import EventIn, TokenIn, ChatMessageIn, MemoryIn, AutonomyIn, ContextIn
+from models import EventIn, TokenIn, ChatMessageIn, MemoryIn, AutonomyIn, ContextIn, RelationshipModeIn
 from utils import now_ms, clamp, day_key, normalize_text
 from memory import (
     add_memory,
     add_affective_memory,
+    add_operational_memory,
+    add_summary_memory,
     remember_analysis_event,
+    remember_relationship_mode,
+    remember_delivery_preferences,
+    remember_routine_profile,
+    remember_user_identity,
     add_episode,
     extract_memories_from_user_text,
     get_semantic_memories,
@@ -30,14 +38,11 @@ from memory import (
     get_episode_count,
 )
 from emotion import (
-    ensure_daily_routine,
     ensure_current_mood,
-    maybe_shift_activity,
     decay_emotions,
     update_drives_passive,
     update_drives_on_user_message,
     reset_daily_push_counter_if_needed,
-    get_relationship_stage,
     ensure_emotional_engine_v2,
     analyze_user_message,
     register_emotional_events_from_analysis,
@@ -60,7 +65,6 @@ from llm import (
     generate_llm_voice_reply,
     generate_llm_proactive_message,
     generate_llm_proactive_voice_message,
-    should_reply_with_voice,
     should_proactive_be_voice,
 )
 from push import send_push_fcm
@@ -93,6 +97,14 @@ ASSISTANT_AUDIO_DIR = MEDIA_ROOT / "assistant"
 USER_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 ASSISTANT_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
+DEFAULT_TIMEZONE = "America/Sao_Paulo"
+SUPPORTED_RELATIONSHIP_MODES = [
+    "friendship",
+    "friends_with_benefits",
+    "open_relationship",
+    "monogamous_relationship",
+]
+
 app.mount("/media", StaticFiles(directory=str(MEDIA_ROOT)), name="media")
 
 
@@ -123,79 +135,165 @@ def load_state():
         print("STATE LOAD ERROR:", e)
 
 
+def get_timezone_name(u: Optional[Dict[str, Any]] = None) -> str:
+    if u:
+        routine_tz = (
+            u.get("routine_profile", {}).get("timezone")
+            or u.get("temporal_context", {}).get("timezone")
+        )
+        if routine_tz:
+            return routine_tz
+    return DEFAULT_TIMEZONE
+
+
+def get_local_now_dt(u: Optional[Dict[str, Any]] = None) -> datetime:
+    return datetime.now(ZoneInfo(get_timezone_name(u)))
+
+
+def classify_part_of_day(hour: int) -> str:
+    if 0 <= hour < 5:
+        return "late_night"
+    if 5 <= hour < 7:
+        return "dawn"
+    if 7 <= hour < 12:
+        return "morning"
+    if 12 <= hour < 18:
+        return "afternoon"
+    if 18 <= hour < 22:
+        return "evening"
+    return "night"
+
+
+def build_temporal_context(u: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    now_local = get_local_now_dt(u)
+    today = now_local.date()
+    yesterday = today - timedelta(days=1)
+    day_before_yesterday = today - timedelta(days=2)
+    tomorrow = today + timedelta(days=1)
+
+    part_of_day = classify_part_of_day(now_local.hour)
+
+    return {
+        "timezone": get_timezone_name(u),
+        "local_now_iso": now_local.isoformat(),
+        "local_date": today.isoformat(),
+        "local_time": now_local.strftime("%H:%M:%S"),
+        "weekday": now_local.strftime("%A").lower(),
+        "is_daytime": 6 <= now_local.hour < 18,
+        "is_night": not (6 <= now_local.hour < 18),
+        "part_of_day": part_of_day,
+        "relative_day_labels": {
+            "today": today.isoformat(),
+            "yesterday": yesterday.isoformat(),
+            "day_before_yesterday": day_before_yesterday.isoformat(),
+            "tomorrow": tomorrow.isoformat(),
+        },
+        "last_computed_at": now_ms(),
+    }
+
+
+def default_weekly_schedule() -> Dict[str, List[Dict[str, Any]]]:
+    return {
+        "monday": [],
+        "tuesday": [],
+        "wednesday": [],
+        "thursday": [],
+        "friday": [],
+        "saturday": [],
+        "sunday": [],
+    }
+
+
+def migrate_user_state(u: Dict[str, Any], user_id: str) -> Dict[str, Any]:
+    u.setdefault("schema_version", 2)
+
+    u.setdefault("identity", {
+        "user_id": user_id,
+        "device_id": u.get("fcm_device_id") or "",
+        "login_name": "",
+        "display_name": u.get("user_name", ""),
+        "created_at": now_ms(),
+        "last_seen_at": now_ms(),
+        "first_boot_completed": bool(u.get("chat")),
+    })
+
+    u.setdefault("user_profile", {
+        "display_name": u.get("user_name", ""),
+        "login_name": "",
+        "traits": {},
+        "preferences_summary": "",
+        "important_facts_summary": "",
+    })
+
+    u.setdefault("relationship_structure", {
+        "current_mode": "friendship",
+        "default_mode": "friendship",
+        "available_modes": SUPPORTED_RELATIONSHIP_MODES[:],
+        "mode_history": [],
+        "transition_policy": {
+            "requires_explicit_confirmation": True,
+            "allow_only_progressive_change": True,
+        },
+        "last_mode_change_at": None,
+    })
+
+    u.setdefault("routine_profile", {
+        "timezone": DEFAULT_TIMEZONE,
+        "weekly_schedule": default_weekly_schedule(),
+        "exceptions": [],
+        "confidence_score": 0.0,
+        "last_updated_at": None,
+    })
+
+    u.setdefault("delivery_preferences", {
+        "inactive_delivery_mode": "text",
+        "allow_background_audio": False,
+        "allow_lockscreen_audio": False,
+        "insistent_mode": False,
+        "quiet_hours_enabled": True,
+        "quiet_hours": {
+            "start": "23:00",
+            "end": "07:00",
+        },
+        "respect_user_routine": True,
+    })
+
+    u.setdefault("temporal_context", build_temporal_context(u))
+
+    u.setdefault("operational_state", {
+        "last_user_message_at": 0,
+        "last_assistant_message_at": 0,
+        "last_push_at": 0,
+        "daily_push_count": u.get("pushes_today", 0),
+        "push_day_key": u.get("pushes_day_key", day_key()),
+        "app_foreground": u.get("device_state", {}).get("app_foreground", False),
+        "screen_on": u.get("device_state", {}).get("screen_interactive", True),
+        "last_known_activity_override": None,
+        "last_sync_at": 0,
+    })
+
+    # remove bootstrap antigo se ele for o único item do chat
+    chat = u.get("chat", [])
+    if len(chat) == 1 and chat[0].get("text", "").startswith("Initial diagnosis:"):
+        u["chat"] = []
+        u["identity"]["first_boot_completed"] = False
+
+    u["identity"]["display_name"] = u.get("user_name", "") or u["identity"].get("display_name", "")
+    u["identity"]["last_seen_at"] = now_ms()
+    u["temporal_context"] = build_temporal_context(u)
+
+    return u
+
+
+def sync_operational_counters(u: Dict[str, Any]):
+    op = u.setdefault("operational_state", {})
+    op["daily_push_count"] = int(u.get("pushes_today", op.get("daily_push_count", 0)))
+    op["push_day_key"] = u.get("pushes_day_key", op.get("push_day_key", day_key()))
+    op["last_push_at"] = int(u.get("last_push_ts_ms", op.get("last_push_at", 0)))
+
+
 def analyze_context_to_emotional_events(text: str) -> list[Dict[str, Any]]:
-    norm = normalize_text(text)
-    events = []
-
-    if any(x in norm for x in ["parque", "caminhando", "andando", "passeando", "walking", "park"]):
-        events.append({
-            "type": "affectionate_message",
-            "intensity": 0.30,
-            "meta": {
-                "affection": 0.28,
-                "engagement": 0.32,
-                "depth": 0.08,
-                "sensuality": 0.00,
-                "coldness": 0.00,
-                "goodbye_quality": 0.00,
-                "absence_justification_quality": 0.15,
-                "return_signal": 0.00,
-                "felt_prioritized_signal": 0.30,
-            }
-        })
-
-    if any(x in norm for x in ["trabalho", "servico", "serviço", "dirigindo", "working", "driving"]):
-        events.append({
-            "type": "absence_justified",
-            "intensity": 0.52,
-            "meta": {
-                "affection": 0.08,
-                "engagement": 0.16,
-                "depth": 0.00,
-                "sensuality": 0.00,
-                "coldness": 0.12,
-                "goodbye_quality": 0.00,
-                "absence_justification_quality": 0.72,
-                "return_signal": 0.00,
-                "felt_prioritized_signal": 0.22,
-            }
-        })
-
-    if any(x in norm for x in ["filho", "filha", "benjamin", "bela", "son", "daughter"]):
-        events.append({
-            "type": "deep_emotional_exchange",
-            "intensity": 0.44,
-            "meta": {
-                "affection": 0.36,
-                "engagement": 0.42,
-                "depth": 0.30,
-                "sensuality": 0.00,
-                "coldness": 0.00,
-                "goodbye_quality": 0.00,
-                "absence_justification_quality": 0.32,
-                "return_signal": 0.00,
-                "felt_prioritized_signal": 0.34,
-            }
-        })
-
-    if not events:
-        events.append({
-            "type": "affectionate_message",
-            "intensity": 0.22,
-            "meta": {
-                "affection": 0.10,
-                "engagement": 0.20,
-                "depth": 0.05,
-                "sensuality": 0.00,
-                "coldness": 0.00,
-                "goodbye_quality": 0.00,
-                "absence_justification_quality": 0.10,
-                "return_signal": 0.00,
-                "felt_prioritized_signal": 0.20,
-            }
-        })
-
-    return events
+    return []
 
 
 def recompute_channel_preferences(u: Dict[str, Any]):
@@ -271,6 +369,9 @@ def append_chat(
 
     if role == "assistant":
         u["unread_assistant_count"] = u.get("unread_assistant_count", 0) + 1
+        u.setdefault("operational_state", {})["last_assistant_message_at"] = ts
+    elif role == "user":
+        u.setdefault("operational_state", {})["last_user_message_at"] = ts
 
     if len(u["chat"]) > 260:
         del u["chat"][:-260]
@@ -493,6 +594,7 @@ def make_response_payload(
     reply_plan: Dict[str, Any],
 ):
     first = assistant_messages[0] if assistant_messages else None
+    u["temporal_context"] = build_temporal_context(u)
 
     return {
         "ok": True,
@@ -506,12 +608,16 @@ def make_response_payload(
         "model": OPENAI_MODEL,
         "memory_count": current_memory_count(u),
         "episode_count": current_episode_count(u),
-        "relationship_stage": get_relationship_stage(u),
+        "relationship_structure": u.get("relationship_structure"),
+        "delivery_preferences": u.get("delivery_preferences"),
+        "user_profile": u.get("user_profile"),
+        "routine_profile": u.get("routine_profile"),
+        "temporal_context": u.get("temporal_context"),
         "channel_preferences": u["channel_preferences"],
         "assistant_typing": u["assistant_typing"],
         "unread_assistant_count": u["unread_assistant_count"],
         "pending_assistant": len(u["pending_replies"]) > 0,
-        "daily_routine": u["daily_routine"],
+        "daily_routine_legacy": u.get("daily_routine", {}),
         "current_mood": u.get("current_mood", {}),
         "emotion_v2": build_emotion_snapshot_v2(u),
     }
@@ -521,7 +627,66 @@ def get_user(user_id: str) -> Dict[str, Any]:
     with STATE_LOCK:
         if user_id not in STATE:
             STATE[user_id] = {
+                "schema_version": 2,
                 "user_name": "",
+                "identity": {
+                    "user_id": user_id,
+                    "device_id": "",
+                    "login_name": "",
+                    "display_name": "",
+                    "created_at": now_ms(),
+                    "last_seen_at": now_ms(),
+                    "first_boot_completed": False,
+                },
+                "user_profile": {
+                    "display_name": "",
+                    "login_name": "",
+                    "traits": {},
+                    "preferences_summary": "",
+                    "important_facts_summary": "",
+                },
+                "relationship_structure": {
+                    "current_mode": "friendship",
+                    "default_mode": "friendship",
+                    "available_modes": SUPPORTED_RELATIONSHIP_MODES[:],
+                    "mode_history": [],
+                    "transition_policy": {
+                        "requires_explicit_confirmation": True,
+                        "allow_only_progressive_change": True,
+                    },
+                    "last_mode_change_at": None,
+                },
+                "routine_profile": {
+                    "timezone": DEFAULT_TIMEZONE,
+                    "weekly_schedule": default_weekly_schedule(),
+                    "exceptions": [],
+                    "confidence_score": 0.0,
+                    "last_updated_at": None,
+                },
+                "delivery_preferences": {
+                    "inactive_delivery_mode": "text",
+                    "allow_background_audio": False,
+                    "allow_lockscreen_audio": False,
+                    "insistent_mode": False,
+                    "quiet_hours_enabled": True,
+                    "quiet_hours": {
+                        "start": "23:00",
+                        "end": "07:00",
+                    },
+                    "respect_user_routine": True,
+                },
+                "temporal_context": build_temporal_context(),
+                "operational_state": {
+                    "last_user_message_at": 0,
+                    "last_assistant_message_at": 0,
+                    "last_push_at": 0,
+                    "daily_push_count": 0,
+                    "push_day_key": day_key(),
+                    "app_foreground": False,
+                    "screen_on": True,
+                    "last_known_activity_override": None,
+                    "last_sync_at": 0,
+                },
                 "status": {
                     "working": False,
                     "duty": False,
@@ -600,22 +765,18 @@ def get_user(user_id: str) -> Dict[str, Any]:
                 "unread_assistant_count": 0,
                 "memories": [],
                 "sent_push_ids": [],
-                "chat": [
-                    {
-                        "role": "assistant",
-                        "text": "Initial diagnosis: we are definitely not in the village anymore. And I liked that. 💛",
-                        "ts_ms": now_ms(),
-                        "audio_url": None,
-                        "modality": "text"
-                    }
-                ],
+                "chat": [],
             }
             save_state()
 
-        ensure_daily_routine(STATE[user_id])
+        STATE[user_id] = migrate_user_state(STATE[user_id], user_id)
+
         ensure_current_mood(STATE[user_id])
         apply_time_update_v2(STATE[user_id])
         recompute_current_mood(STATE[user_id])
+        STATE[user_id]["temporal_context"] = build_temporal_context(STATE[user_id])
+        sync_operational_counters(STATE[user_id])
+
         return STATE[user_id]
 
 
@@ -626,8 +787,13 @@ def schedule_pending_reply(
     reply_plan: Optional[Dict[str, Any]] = None
 ):
     scarcity = u["autonomy_settings"]["scarcity_level"]
-    activity = u["daily_routine"]["current_activity"]
     current_mood = u.get("current_mood", {})
+
+    activity_hint = (
+        u.get("operational_state", {}).get("last_known_activity_override")
+        or u.get("temporal_context", {}).get("part_of_day")
+        or "unknown"
+    )    
 
     base_delay = 1400
 
@@ -657,7 +823,7 @@ def schedule_pending_reply(
         "user_text": user_text,
         "source": source,
         "reply_plan": reply_plan or {},
-        "activity_hint": activity,
+        "activity_hint": activity_hint,
     })
     set_typing(u, True)
 
@@ -726,32 +892,6 @@ def save_user_audio(upload: UploadFile) -> tuple[Path, str]:
     return file_path, media_url("user", filename)
 
 
-def build_assistant_reply(u: Dict[str, Any], user_text: str, source: str) -> tuple[str, str, Optional[str]]:
-    reply_with_voice = should_reply_with_voice(u, user_text, source)
-
-    if reply_with_voice:
-        reply_text = generate_llm_voice_reply(
-            u,
-            user_text,
-            OPENAI_ENABLED,
-            openai_client,
-            OPENAI_MODEL
-        )
-        audio_url = synthesize_speech(reply_text)
-        if audio_url:
-            return reply_text, "voice", audio_url
-        return reply_text, "text", None
-
-    reply_text = generate_llm_reply(
-        u,
-        user_text,
-        OPENAI_ENABLED,
-        openai_client,
-        OPENAI_MODEL
-    )
-    return reply_text, "text", None
-
-
 def process_user_text_message(
     u: Dict[str, Any],
     user_text: str,
@@ -763,6 +903,9 @@ def process_user_text_message(
 
     now = now_ms()
     user_modality = "voice" if source == "audio" else "text"
+    
+    u["identity"]["last_seen_at"] = now
+    u["temporal_context"] = build_temporal_context(u)
 
     append_chat(
         u,
@@ -831,12 +974,16 @@ def process_user_text_message(
         "model": OPENAI_MODEL,
         "memory_count": current_memory_count(u),
         "episode_count": current_episode_count(u),
-        "relationship_stage": get_relationship_stage(u),
+        "relationship_structure": u.get("relationship_structure"),
+        "delivery_preferences": u.get("delivery_preferences"),
+        "user_profile": u.get("user_profile"),
+        "routine_profile": u.get("routine_profile"),
+        "temporal_context": u.get("temporal_context"),
         "channel_preferences": u["channel_preferences"],
         "assistant_typing": u["assistant_typing"],
         "unread_assistant_count": u["unread_assistant_count"],
         "pending_assistant": len(u["pending_replies"]) > 0,
-        "daily_routine": u["daily_routine"],
+        "daily_routine_legacy": u.get("daily_routine", {}),
         "current_mood": u.get("current_mood", {}),
         "emotion_v2": build_emotion_snapshot_v2(u),
     }
@@ -844,10 +991,41 @@ def process_user_text_message(
 
 def should_send_proactive_push(u: Dict[str, Any]) -> bool:
     device = u.get("device_state", {})
-    app_foreground = bool(device.get("app_foreground", False))
+    delivery = u.get("delivery_preferences", {})
+    operational = u.get("operational_state", {})
 
+    app_foreground = bool(device.get("app_foreground", False))
     if app_foreground:
         return False
+
+    reset_daily_push_counter_if_needed(u)
+
+    insistent_mode = bool(delivery.get("insistent_mode", False))
+    pushes_today = int(u.get("operational_state", {}).get("daily_push_count", u.get("pushes_today", 0)))
+
+    max_daily_pushes = 12 if insistent_mode else 4
+    if pushes_today >= max_daily_pushes:
+        return False
+
+    quiet_hours_enabled = bool(delivery.get("quiet_hours_enabled", True))
+    quiet_hours = delivery.get("quiet_hours", {"start": "23:00", "end": "07:00"})
+    now_local = get_local_now_dt(u)
+    current_hm = now_local.strftime("%H:%M")
+
+    if quiet_hours_enabled:
+        start = quiet_hours.get("start", "23:00")
+        end = quiet_hours.get("end", "07:00")
+
+        if start <= end:
+            if start <= current_hm < end:
+                return False
+        else:
+            if current_hm >= start or current_hm < end:
+                return False
+
+    operational["app_foreground"] = app_foreground
+    operational["screen_on"] = bool(device.get("screen_interactive", True))
+    u["operational_state"] = operational
 
     return True
 
@@ -937,6 +1115,12 @@ def process_pending_replies():
                                 u["last_push_ts_ms"] = now_ms()
                                 u["last_push_text"] = assistant_messages[0]["text"]
                                 u["pushes_today"] = u.get("pushes_today", 0) + 1
+                                u["pushes_day_key"] = day_key()
+
+                                u["operational_state"]["last_push_at"] = u["last_push_ts_ms"]
+                                u["operational_state"]["daily_push_count"] = u["pushes_today"]
+                                u["operational_state"]["push_day_key"] = u["pushes_day_key"]
+
                                 save_state()
                             else:
                                 print("PENDING PUSH NON-200:", getattr(r, "status_code", None), getattr(r, "text", "")[:300])
@@ -970,11 +1154,10 @@ def maybe_send_proactive_messages():
                     if not settings.get("interruptions_enabled", True):
                         continue
 
-                    ensure_daily_routine(u)
-                    maybe_shift_activity(u)
                     decay_emotions(u)
                     update_drives_passive(u)
                     apply_time_update_v2(u)
+                    u["temporal_context"] = build_temporal_context(u)
                     ensure_emotional_engine_v2(u)
                     ensure_current_mood(u)
                     consolidate_emotional_narratives(u)
@@ -1023,7 +1206,14 @@ def maybe_send_proactive_messages():
                         continue
 
                     token = u.get("fcm_token")
-                    use_voice = should_proactive_be_voice(u)
+                    delivery_mode = u.get("delivery_preferences", {}).get("inactive_delivery_mode", "text")
+                    allow_background_audio = bool(u.get("delivery_preferences", {}).get("allow_background_audio", False))
+
+                    use_voice = (
+                        allow_background_audio
+                        and delivery_mode in ("audio", "both")
+                        and should_proactive_be_voice(u)
+                    )
 
                 if use_voice:
                     text = generate_llm_proactive_voice_message(
@@ -1072,6 +1262,13 @@ def maybe_send_proactive_messages():
                     u["last_push_ts_ms"] = now_ms()
                     u["last_push_text"] = text
 
+                    u["pushes_today"] = u.get("pushes_today", 0) + 1
+                    u["pushes_day_key"] = day_key()
+
+                    u["operational_state"]["last_push_at"] = u["last_push_ts_ms"]
+                    u["operational_state"]["daily_push_count"] = u["pushes_today"]
+                    u["operational_state"]["push_day_key"] = u["pushes_day_key"]
+
                     append_chat(
                         u,
                         "assistant",
@@ -1095,6 +1292,141 @@ def autosave_loop():
         time.sleep(20)
         with STATE_LOCK:
             save_state()
+
+
+def _merge_delivery_preferences(u: Dict[str, Any], payload: Dict[str, Any]):
+    prefs = u.setdefault("delivery_preferences", {})
+
+    if "inactive_delivery_mode" in payload and payload["inactive_delivery_mode"] in {"text", "audio", "both"}:
+        prefs["inactive_delivery_mode"] = payload["inactive_delivery_mode"]
+
+    if "allow_background_audio" in payload:
+        prefs["allow_background_audio"] = bool(payload["allow_background_audio"])
+
+    if "allow_lockscreen_audio" in payload:
+        prefs["allow_lockscreen_audio"] = bool(payload["allow_lockscreen_audio"])
+
+    if "insistent_mode" in payload:
+        prefs["insistent_mode"] = bool(payload["insistent_mode"])
+
+    if "quiet_hours_enabled" in payload:
+        prefs["quiet_hours_enabled"] = bool(payload["quiet_hours_enabled"])
+
+    if "quiet_hours" in payload and isinstance(payload["quiet_hours"], dict):
+        qh = payload["quiet_hours"]
+        prefs["quiet_hours"] = {
+            "start": str(qh.get("start", prefs.get("quiet_hours", {}).get("start", "23:00"))),
+            "end": str(qh.get("end", prefs.get("quiet_hours", {}).get("end", "07:00"))),
+        }
+
+    if "respect_user_routine" in payload:
+        prefs["respect_user_routine"] = bool(payload["respect_user_routine"])
+
+
+def _merge_routine_profile(u: Dict[str, Any], payload: Dict[str, Any]):
+    routine = u.setdefault("routine_profile", {})
+
+    if "timezone" in payload and payload["timezone"]:
+        routine["timezone"] = str(payload["timezone"])
+
+    if "weekly_schedule" in payload and isinstance(payload["weekly_schedule"], dict):
+        routine["weekly_schedule"] = payload["weekly_schedule"]
+
+    if "exceptions" in payload and isinstance(payload["exceptions"], list):
+        routine["exceptions"] = payload["exceptions"]
+
+    routine["last_updated_at"] = now_ms()
+
+
+@app.get("/routine_profile/{user_id}")
+def get_routine_profile(user_id: str):
+    u = get_user(user_id)
+    return {
+        "ok": True,
+        "routine_profile": u.get("routine_profile", {}),
+    }
+
+
+@app.post("/routine_profile/{user_id}")
+def set_routine_profile(user_id: str, payload: Dict[str, Any]):
+    u = get_user(user_id)
+
+    previous = dict(u.get("routine_profile", {}))
+    _merge_routine_profile(u, payload)
+    u["temporal_context"] = build_temporal_context(u)
+    current = u.get("routine_profile", {})
+
+    remember_routine_profile(
+        u,
+        timezone=current.get("timezone", DEFAULT_TIMEZONE),
+        weekly_schedule=current.get("weekly_schedule", {}),
+    )
+
+    add_episode(
+        u,
+        episode_type="routine_profile_update",
+        summary="Routine profile was updated",
+        details={
+            "previous": previous,
+            "current": current,
+        },
+        tags=["routine", "schedule", "settings"],
+        importance=8,
+    )
+
+    save_state()
+
+    return {
+        "ok": True,
+        "routine_profile": current,
+        "temporal_context": u.get("temporal_context", {}),
+    }
+
+
+@app.get("/delivery_preferences/{user_id}")
+def get_delivery_preferences(user_id: str):
+    u = get_user(user_id)
+    return {
+        "ok": True,
+        "delivery_preferences": u.get("delivery_preferences", {}),
+    }
+
+
+@app.post("/delivery_preferences/{user_id}")
+def set_delivery_preferences(user_id: str, payload: Dict[str, Any]):
+    u = get_user(user_id)
+
+    previous = dict(u.get("delivery_preferences", {}))
+    _merge_delivery_preferences(u, payload)
+    current = u.get("delivery_preferences", {})
+
+    if current != previous:
+        remember_delivery_preferences(
+            u,
+            inactive_delivery_mode=current.get("inactive_delivery_mode", "text"),
+            allow_background_audio=bool(current.get("allow_background_audio", False)),
+            allow_lockscreen_audio=bool(current.get("allow_lockscreen_audio", False)),
+            insistent_mode=bool(current.get("insistent_mode", False)),
+        )
+
+        add_episode(
+            u,
+            episode_type="delivery_preferences_update",
+            summary="Delivery preferences were updated",
+            details={
+                "previous": previous,
+                "current": current,
+            },
+            tags=["delivery", "preferences", "settings"],
+            importance=7,
+        )
+
+    save_state()
+
+    return {
+        "ok": True,
+        "delivery_preferences": current,
+    }
 
 
 @app.on_event("startup")
@@ -1139,7 +1471,9 @@ def get_autonomy(user_id: str):
     return {
         "autonomy_settings": u["autonomy_settings"],
         "drives": u["drives"],
-        "daily_routine": u["daily_routine"],
+        "daily_routine_legacy": u.get("daily_routine", {}),
+        "routine_profile": u.get("routine_profile", {}),
+        "temporal_context": u.get("temporal_context", {}),
         "current_mood": u.get("current_mood", {}),
         "channel_preferences": u["channel_preferences"],
         "emotion_v2": build_emotion_snapshot_v2(u),
@@ -1160,11 +1494,11 @@ def set_autonomy(user_id: str, data: AutonomyIn):
 @app.get("/routine/{user_id}")
 def get_routine(user_id: str):
     u = get_user(user_id)
-    ensure_daily_routine(u)
-    maybe_shift_activity(u)
-    apply_time_update_v2(u)
+    u["temporal_context"] = build_temporal_context(u)
     return {
-        "daily_routine": u["daily_routine"],
+        "routine_profile": u.get("routine_profile", {}),
+        "daily_routine_legacy": u.get("daily_routine", {}),
+        "temporal_context": u.get("temporal_context", {}),
         "current_mood": u.get("current_mood", {}),
         "drives": u["drives"],
         "channel_preferences": u["channel_preferences"],
@@ -1184,10 +1518,12 @@ def get_narratives(user_id: str):
 @app.get("/unread/{user_id}")
 def unread(user_id: str):
     u = get_user(user_id)
+    u["temporal_context"] = build_temporal_context(u)
     return {
         "unread_assistant_count": u.get("unread_assistant_count", 0),
         "last_read_ts_ms": u.get("last_read_ts_ms", 0),
-        "relationship_stage": get_relationship_stage(u),
+        "relationship_structure": u.get("relationship_structure"),
+        "temporal_context": u.get("temporal_context", {}),
         "latest_unread_preview": latest_unread_preview(u),
         "pending_replies": len(u.get("pending_replies", [])),
         "assistant_typing": u.get("assistant_typing", False)
@@ -1211,11 +1547,10 @@ def get_episodes(user_id: str, q: str = Query(default="")):
 @app.post("/event")
 def receive_event(e: EventIn):
     u = get_user(e.user_id)
-    ensure_daily_routine(u)
-    maybe_shift_activity(u)
     decay_emotions(u)
     update_drives_passive(u)
     apply_time_update_v2(u)
+    u["temporal_context"] = build_temporal_context(u)
     u["last_event_ts_ms"] = now_ms()
 
     if e.event_type == "STATUS_SET":
@@ -1294,6 +1629,11 @@ def receive_event(e: EventIn):
         ds["screen_interactive"] = bool(e.payload.get("screen_interactive", ds["screen_interactive"]))
         ds["updated_ts_ms"] = e.ts_ms
 
+        op = u.setdefault("operational_state", {})
+        op["app_foreground"] = ds["app_foreground"]
+        op["screen_on"] = ds["screen_interactive"]
+        op["last_sync_at"] = e.ts_ms
+
     save_state()
     return {"ok": True}
 
@@ -1301,11 +1641,10 @@ def receive_event(e: EventIn):
 @app.post("/context")
 def receive_context(ctx: ContextIn):
     u = get_user(ctx.user_id)
-    ensure_daily_routine(u)
-    maybe_shift_activity(u)
     decay_emotions(u)
     update_drives_passive(u)
     apply_time_update_v2(u)
+    u["temporal_context"] = build_temporal_context(u)
 
     text = ctx.text.strip()
     if not text:
@@ -1354,6 +1693,7 @@ def receive_context(ctx: ContextIn):
 def state(user_id: str):
     u = get_user(user_id)
     apply_time_update_v2(u)
+    u["temporal_context"] = build_temporal_context(u)
 
     state_payload = dict(u)
     state_payload["memories"] = current_memories(u)
@@ -1361,7 +1701,10 @@ def state(user_id: str):
 
     return {
         **state_payload,
-        "relationship_stage": get_relationship_stage(u),
+        "relationship_structure": u.get("relationship_structure"),
+        "delivery_preferences": u.get("delivery_preferences"),
+        "routine_profile": u.get("routine_profile"),
+        "temporal_context": u.get("temporal_context"),
         "emotion_v2": build_emotion_snapshot_v2(u),
         "initiative_score_v2": compute_initiative_score_v2(u),
     }
@@ -1371,12 +1714,18 @@ def state(user_id: str):
 def last(user_id: str):
     u = get_user(user_id)
     apply_time_update_v2(u)
+    u["temporal_context"] = build_temporal_context(u)
+
     return {
         "status": u["status"],
         "device_state": u["device_state"],
         "emotion": u["emotion"],
         "drives": u["drives"],
-        "daily_routine": u["daily_routine"],
+        "daily_routine_legacy": u.get("daily_routine", {}),
+        "relationship_structure": u.get("relationship_structure"),
+        "delivery_preferences": u.get("delivery_preferences"),
+        "routine_profile": u.get("routine_profile"),
+        "temporal_context": u.get("temporal_context"),
         "current_mood": u.get("current_mood", {}),
         "channel_preferences": u["channel_preferences"],
         "autonomy_settings": u["autonomy_settings"],
@@ -1392,7 +1741,6 @@ def last(user_id: str):
         "episode_count": current_episode_count(u),
         "narrative_count": len(u["emotional_narratives"]),
         "unread_assistant_count": u["unread_assistant_count"],
-        "relationship_stage": get_relationship_stage(u),
         "emotion_v2": build_emotion_snapshot_v2(u),
         "initiative_score_v2": compute_initiative_score_v2(u),
     }
@@ -1403,6 +1751,16 @@ def register_token(t: TokenIn):
     u = get_user(t.user_id)
     u["fcm_token"] = t.fcm_token
     u["fcm_device_id"] = t.device_id
+    u["identity"]["device_id"] = t.device_id
+
+    add_operational_memory(
+        u,
+        f"Registered device token for device {t.device_id}",
+        tags=["device", "token", "operational"],
+        importance=5,
+        meta={"device_id": t.device_id},
+    )
+
     save_state()
     return {"ok": True}
 
@@ -1413,13 +1771,37 @@ def set_user_name(user_id: str, name: str):
 
     clean = name.strip()[:80]
     if clean:
+        previous_name = u.get("identity", {}).get("display_name", "") or u.get("user_name", "")
         u["user_name"] = clean
+        u["identity"]["display_name"] = clean
+        u["user_profile"]["display_name"] = clean
+
+        if clean != previous_name:
+            remember_user_identity(
+                u,
+                display_name=clean,
+                login_name=u.get("identity", {}).get("login_name") or None,
+            )
+
+            add_episode(
+                u,
+                episode_type="identity_update",
+                summary=f"User display name updated to {clean}",
+                details={
+                    "previous_name": previous_name,
+                    "new_name": clean,
+                },
+                tags=["identity", "user"],
+                importance=7,
+            )
 
     save_state()
 
     return {
         "ok": True,
-        "user_name": u["user_name"]
+        "user_name": u["user_name"],
+        "identity": u["identity"],
+        "user_profile": u["user_profile"],
     }
 
 
@@ -1427,7 +1809,7 @@ def set_user_name(user_id: str, name: str):
 def get_user_name(user_id: str):
     u = get_user(user_id)
     return {
-        "user_name": u.get("user_name", "")
+        "user_name": u.get("identity", {}).get("display_name", "") or u.get("user_name", "")
     }
 
 
@@ -1453,11 +1835,15 @@ def add_memory_endpoint(user_id: str, mem: MemoryIn):
 def get_chat(user_id: str):
     u = get_user(user_id)
     mark_chat_read(u)
+    u["temporal_context"] = build_temporal_context(u)
     save_state()
     return {
         "messages": u["chat"],
         "unread_assistant_count": u["unread_assistant_count"],
-        "relationship_stage": get_relationship_stage(u),
+        "relationship_structure": u.get("relationship_structure"),
+        "delivery_preferences": u.get("delivery_preferences"),
+        "routine_profile": u.get("routine_profile"),
+        "temporal_context": u.get("temporal_context"),
         "pending_assistant": len(u["pending_replies"]) > 0,
         "assistant_typing": u.get("assistant_typing", False),
         "emotion_v2": build_emotion_snapshot_v2(u),
@@ -1467,8 +1853,6 @@ def get_chat(user_id: str):
 @app.post("/chat/{user_id}/send")
 def send_chat(user_id: str, msg: ChatMessageIn):
     u = get_user(user_id)
-    ensure_daily_routine(u)
-    maybe_shift_activity(u)
     decay_emotions(u)
     update_drives_passive(u)
     apply_time_update_v2(u)
@@ -1488,8 +1872,6 @@ def send_chat(user_id: str, msg: ChatMessageIn):
 @app.post("/chat/{user_id}/send_audio")
 async def send_audio(user_id: str, file: UploadFile = File(...)):
     u = get_user(user_id)
-    ensure_daily_routine(u)
-    maybe_shift_activity(u)
     decay_emotions(u)
     update_drives_passive(u)
     apply_time_update_v2(u)
@@ -1506,3 +1888,53 @@ async def send_audio(user_id: str, file: UploadFile = File(...)):
         source="audio",
         user_audio_url=uploaded_audio_url
     )
+
+
+@app.post("/relationship_mode/{user_id}")
+def set_relationship_mode(user_id: str, data: RelationshipModeIn):
+    u = get_user(user_id)
+
+    mode = data.mode
+    current_mode = u["relationship_structure"].get("current_mode", "friendship")
+
+    if current_mode == mode:
+        return {
+            "ok": True,
+            "relationship_structure": u["relationship_structure"],
+        }
+
+    now = now_ms()
+
+    u["relationship_structure"]["current_mode"] = mode
+    u["relationship_structure"]["last_mode_change_at"] = now
+    u["relationship_structure"].setdefault("mode_history", []).append({
+        "from": current_mode,
+        "to": mode,
+        "ts_ms": now,
+    })
+
+    remember_relationship_mode(
+        u,
+        mode=mode,
+        previous_mode=current_mode,
+    )
+
+    add_episode(
+        u,
+        episode_type="relationship_mode_change",
+        summary=f"Relationship mode changed from {current_mode} to {mode}",
+        details={
+            "from": current_mode,
+            "to": mode,
+        },
+        tags=["relationship", "mode_change"],
+        importance=8,
+    )
+
+    consolidate_emotional_narratives(u)
+    save_state()
+
+    return {
+        "ok": True,
+        "relationship_structure": u["relationship_structure"],
+    }

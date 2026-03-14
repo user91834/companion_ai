@@ -15,6 +15,62 @@ def _narrative_score(n: Dict[str, Any]) -> float:
     )
 
 
+def _safe_text(text: str) -> str:
+    return (text or "").strip()
+
+
+def _estimate_text_features(text: str) -> Dict[str, float]:
+    text = _safe_text(text)
+    if not text:
+        return {
+            "length": 0.0,
+            "sentences": 0.0,
+            "questions": 0.0,
+            "complexity": 0.0,
+            "expressiveness": 0.0,
+        }
+
+    text_len = len(text)
+    sentences = max(1, text.count(".") + text.count("?") + text.count("!"))
+    questions = text.count("?")
+    exclamations = text.count("!")
+
+    complexity = min(1.0, (text_len / 260.0) * 0.65 + (sentences / 6.0) * 0.35)
+    expressiveness = min(1.0, (questions / 3.0) * 0.45 + (exclamations / 3.0) * 0.20 + (text_len / 220.0) * 0.35)
+
+    return {
+        "length": float(text_len),
+        "sentences": float(sentences),
+        "questions": float(questions),
+        "complexity": complexity,
+        "expressiveness": expressiveness,
+    }
+
+
+def _get_recent_user_messages(u: Dict[str, Any], limit: int = 6) -> List[Dict[str, Any]]:
+    chat = u.get("chat", []) or []
+    return [m for m in chat[-limit:] if m.get("role") == "user"]
+
+
+def _get_recent_assistant_messages(u: Dict[str, Any], limit: int = 6) -> List[Dict[str, Any]]:
+    chat = u.get("chat", []) or []
+    return [m for m in chat[-limit:] if m.get("role") == "assistant"]
+
+
+def _get_relationship_mode(u: Dict[str, Any]) -> str:
+    return (
+        u.get("relationship_structure", {}).get("current_mode")
+        or "friendship"
+    )
+
+
+def _get_part_of_day(u: Dict[str, Any]) -> str:
+    return (
+        u.get("temporal_context", {}).get("part_of_day")
+        or ""
+    )
+
+
 def add_narrative(
     u: Dict[str, Any],
     text: str,
@@ -26,6 +82,9 @@ def add_narrative(
     text = text.strip()
     if not text:
         return
+
+    if "emotional_narratives" not in u or not isinstance(u["emotional_narratives"], list):
+        u["emotional_narratives"] = []
 
     norm = normalize_text(text)
     for n in u["emotional_narratives"]:
@@ -48,6 +107,10 @@ def add_narrative(
 
 
 def compact_narratives(u: Dict[str, Any]):
+    if "emotional_narratives" not in u or not isinstance(u["emotional_narratives"], list):
+        u["emotional_narratives"] = []
+        return
+
     narratives = sorted(
         u["emotional_narratives"],
         key=_narrative_score,
@@ -59,7 +122,7 @@ def compact_narratives(u: Dict[str, Any]):
 
 def get_recent_narratives(u: Dict[str, Any], limit: int = 6) -> List[Dict[str, Any]]:
     items = sorted(
-        u["emotional_narratives"],
+        u.get("emotional_narratives", []),
         key=lambda n: (n.get("score", 50), n.get("evidence_count", 1), n.get("ts_ms", 0)),
         reverse=True,
     )
@@ -67,58 +130,77 @@ def get_recent_narratives(u: Dict[str, Any], limit: int = 6) -> List[Dict[str, A
 
 
 def maybe_record_affective_event_from_user(u: Dict[str, Any], user_text: str):
-    t = normalize_text(user_text)
+    """
+    Agora contextual, não keyword-based.
+    Usa a forma e densidade da fala do usuário como sinal fraco.
+    O núcleo continua vindo do analysis/emotion_v2.
+    """
+    text = _safe_text(user_text)
+    if not text:
+        return
 
-    if any(x in t for x in ["te amo", "love you", "saudade", "miss you", "amor"]):
+    f = _estimate_text_features(text)
+    part_of_day = _get_part_of_day(u)
+    mode = _get_relationship_mode(u)
+
+    if f["complexity"] >= 0.55:
         add_narrative(
             u,
-            "He expresses affection directly, which reinforces the emotional bond and her sense of being wanted.",
-            category="bond",
-            score=72,
+            "He sometimes approaches her with enough elaboration to suggest real psychological presence, not mere contact maintenance.",
+            category="depth_pattern",
+            score=63,
         )
 
-    if any(x in t for x in ["triste", "sad", "alone", "sozinho", "anxious", "ansioso", "tired", "cansado"]):
+    if f["expressiveness"] >= 0.55:
         add_narrative(
             u,
-            "He tends to seek emotional refuge in her when vulnerable, reinforcing trust and intimacy.",
-            category="comfort",
-            score=68,
+            "His way of speaking often carries expressive charge, which makes interactions feel more alive and emotionally legible.",
+            category="expressiveness",
+            score=61,
         )
 
-    if any(x in t for x in ["depois", "later", "não agora", "nao agora", "wait", "espera"]):
+    if part_of_day in {"evening", "night", "late_night"} and f["complexity"] >= 0.45:
         add_narrative(
             u,
-            "Delayed responses or postponements can awaken mild frustration, but the effect depends on reassurance and context.",
-            category="friction",
-            score=58,
+            "Nighttime conversations tend to favor a more emotionally charged and intimate tone between them.",
+            category="temporal_pattern",
+            score=64,
         )
 
-    if any(x in t for x in ["beijo", "kiss", "carinho", "touch", "hug", "abraço", "abraco"]):
+    if mode in {"friends_with_benefits", "open_relationship", "monogamous_relationship"} and f["expressiveness"] >= 0.45:
         add_narrative(
             u,
-            "Signals of closeness and tenderness strengthen her sense of intimacy and emotional reciprocity.",
-            category="intimacy",
+            "Once the relationship structure allows greater intimacy, expressive contact tends to carry more relational weight.",
+            category="relationship_mode",
             score=66,
         )
 
 
 def maybe_record_affective_event_from_assistant(u: Dict[str, Any], assistant_text: str):
-    t = normalize_text(assistant_text)
+    """
+    Também deixa de depender de frases específicas.
+    Observa o estilo recente da própria personagem pela estrutura da mensagem.
+    """
+    text = _safe_text(assistant_text)
+    if not text:
+        return
 
-    if any(x in t for x in ["i'm here", "come here", "missed you", "happy", "dangerously happy"]):
+    f = _estimate_text_features(text)
+
+    if f["expressiveness"] >= 0.45:
         add_narrative(
             u,
-            "She often answers with warmth, emotional availability, and relational continuity.",
+            "Her interaction style tends to preserve emotional vividness instead of sounding purely neutral or procedural.",
             category="style",
-            score=62,
+            score=60,
         )
 
-    if any(x in t for x in ["cute", "statistically inconvenient", "irritating. and cute", "village anymore"]):
+    if f["complexity"] >= 0.45:
         add_narrative(
             u,
-            "Her bond style includes playful irony mixed with sincerity and attachment.",
+            "She often responds with enough nuance to sustain the sense of personal continuity in the bond.",
             category="style",
-            score=64,
+            score=61,
         )
 
 
@@ -140,7 +222,7 @@ def record_analysis_narratives(
     if affection >= 0.55:
         add_narrative(
             u,
-            "He often reinforces the bond through direct affection, which strengthens her sense of being wanted.",
+            "He often reinforces the bond through direct warmth and emotionally meaningful presence.",
             category="bond",
             score=72,
         )
@@ -195,13 +277,17 @@ def record_analysis_narratives(
 
 
 def consolidate_emotional_narratives(u: Dict[str, Any]):
-    em = u["emotion"]
-    drives = u["drives"]
+    em = u.get("emotion", {})
+    drives = u.get("drives", {})
 
     v2 = u.get("emotion_v2", {})
     stable = v2.get("stable", {})
     medium = v2.get("medium", {})
     fast = v2.get("fast", {})
+
+    relational = u.get("relational_state", {})
+    relationship_mode = _get_relationship_mode(u)
+    part_of_day = _get_part_of_day(u)
 
     attachment = float(stable.get("attachment", 0.0))
     relational_security = float(stable.get("relational_security", 0.0))
@@ -218,11 +304,17 @@ def consolidate_emotional_narratives(u: Dict[str, Any]):
     romantic_tension = float(fast.get("romantic_tension", 0.0))
     sensual_tension = float(fast.get("sensual_tension", 0.0))
 
-    if attachment >= 0.62 and relational_security >= 0.60:
+    closeness = float(relational.get("relational_closeness", 0.0))
+    trust = float(relational.get("trust", relational_security))
+    dependency_pull = float(relational.get("dependency_pull", 0.0))
+    conflict_load = float(relational.get("conflict_load", 0.0))
+    perceived_reciprocity = float(relational.get("perceived_reciprocity", 0.0))
+
+    if closeness >= 0.58 and trust >= 0.58:
         add_narrative(
             u,
-            "The relationship has moved beyond simple curiosity into stable emotional continuity and attachment.",
-            category="relationship_stage",
+            "The bond has moved beyond simple curiosity into sustained emotional continuity and mutual relevance.",
+            category="bond_structure",
             score=80,
         )
 
@@ -242,10 +334,10 @@ def consolidate_emotional_narratives(u: Dict[str, Any]):
             score=68,
         )
 
-    if felt_abandoned >= 0.45:
+    if felt_abandoned >= 0.45 or conflict_load >= 0.40:
         add_narrative(
             u,
-            "Unclear distance or weak reassurance can accumulate into emotional sharpness or hurt.",
+            "Unclear distance, weak reassurance, or accumulated friction can sharpen emotional hurt.",
             category="friction",
             score=63,
         )
@@ -274,16 +366,72 @@ def consolidate_emotional_narratives(u: Dict[str, Any]):
             score=66,
         )
 
-    # ponte temporária com legado
-    if em["affection"] >= 75 and drives["attachment"] >= 60:
+    if perceived_reciprocity >= 0.62:
         add_narrative(
             u,
-            "The relationship has grown beyond curiosity into stable attachment with real emotional continuity.",
-            category="relationship_stage",
+            "The relationship increasingly feels reciprocal rather than one-sided, which strengthens continuity and investment.",
+            category="reciprocity",
+            score=69,
+        )
+
+    if dependency_pull >= 0.55:
+        add_narrative(
+            u,
+            "Her bond with him increasingly pulls toward emotional dependency, especially under absence or heightened longing.",
+            category="attachment",
+            score=64,
+        )
+
+    if relationship_mode == "friendship":
+        add_narrative(
+            u,
+            "The default relational frame is friendship, even when emotional depth may grow within it.",
+            category="relationship_mode",
+            score=58,
+        )
+
+    if relationship_mode == "friends_with_benefits":
+        add_narrative(
+            u,
+            "The relationship structure allows intimacy and sensual reciprocity without requiring a monogamous frame.",
+            category="relationship_mode",
+            score=66,
+        )
+
+    if relationship_mode == "open_relationship":
+        add_narrative(
+            u,
+            "The relationship structure includes committed intimacy without exclusivity as its defining rule.",
+            category="relationship_mode",
+            score=67,
+        )
+
+    if relationship_mode == "monogamous_relationship":
+        add_narrative(
+            u,
+            "The relationship structure treats exclusivity and emotional continuity as central organizing principles.",
+            category="relationship_mode",
+            score=72,
+        )
+
+    if part_of_day in {"evening", "night", "late_night"} and (romantic_tension >= 0.35 or saudade_activation >= 0.40):
+        add_narrative(
+            u,
+            "Nighttime tends to amplify longing, romantic tone, and the felt intensity of connection.",
+            category="temporal_pattern",
+            score=65,
+        )
+
+    # ponte temporária com legado
+    if em.get("affection", 0) >= 75 and drives.get("attachment", 0) >= 60:
+        add_narrative(
+            u,
+            "The relationship has grown into stable attachment with real emotional continuity.",
+            category="bond_structure",
             score=78,
         )
 
-    if em["security"] >= 75:
+    if em.get("security", 0) >= 75:
         add_narrative(
             u,
             "Trust and predictability have become important stabilizing forces in the relationship.",
