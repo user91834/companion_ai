@@ -21,6 +21,13 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_ENABLED = bool(OPENAI_API_KEY)
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-nano")
 
+# ----- TTS (OpenAI ou Inworld) -----
+# TTS_PROVIDER = "openai" | "inworld". Se "inworld", usa Inworld TTS quando INWORLD_API_KEY estiver definida.
+TTS_PROVIDER = os.environ.get("TTS_PROVIDER", "openai").lower()
+INWORLD_API_KEY = os.environ.get("INWORLD_API_KEY", "")
+INWORLD_TTS_VOICE_ID = os.environ.get("INWORLD_TTS_VOICE_ID", "Dennis")  # ex: Dennis, Ashley
+INWORLD_TTS_MODEL_ID = os.environ.get("INWORLD_TTS_MODEL_ID", "inworld-tts-1.5-max")
+
 # ----- Auth -----
 JWT_SECRET = os.environ.get("JWT_SECRET", "")
 AUTH_DISABLED = os.environ.get("AUTH_DISABLED", "").lower() in ("1", "true", "yes")

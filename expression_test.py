@@ -41,7 +41,7 @@ from torso_controller import (
 def make_test_state() -> Dict[str, Any]:
     return {
         "emotion_state": make_default_emotional_state(),
-        "micro_state": make_default_micro_state(),
+        "micro_state": make_default_micro_state(now=0.0),
         "direction_state": make_default_direction_state(),
         "eye_state": make_default_eye_state(),
         "face_controller_state": make_default_controller_state(),
@@ -242,8 +242,8 @@ def print_frame_summary(frame: Dict[str, Any]) -> None:
 
 def run_demo(
     user_emotion: str = "affection",
-    duration_ms: int = 3000,
-    step_ms: int = 200,
+    duration_ms: int = 10000,
+    step_ms: int = 100,
     speaking: bool = False,
     kiss_active: bool = False,
     speech_timeline: Optional[list] = None,
@@ -275,8 +275,8 @@ if __name__ == "__main__":
     print("\n########## DEMO 1: AFETO / ESCUTA ##########\n")
     run_demo(
         user_emotion="affection",
-        duration_ms=2400,
-        step_ms=200,
+        duration_ms=10000,
+        step_ms=100,
         speaking=False,
         kiss_active=False,
     )

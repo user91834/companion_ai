@@ -6,6 +6,7 @@ import threading
 import time
 import os
 import uuid
+import base64
 import shutil
 from pathlib import Path
 import json
@@ -24,6 +25,7 @@ from config import (
     MAX_CHAT_MESSAGES, PENDING_REPLY_BASE_DELAY_MS, PENDING_REPLY_MIN_DELAY_MS,
     AUTOSAVE_INTERVAL_SEC, PROACTIVE_LOOP_INTERVAL_SEC, PENDING_REPLY_POLL_INTERVAL_SEC,
     MAX_UPLOAD_AUDIO_BYTES, ALLOWED_AUDIO_MIME_TYPES,
+    TTS_PROVIDER, INWORLD_API_KEY, INWORLD_TTS_VOICE_ID, INWORLD_TTS_MODEL_ID,
 )
 from auth import validate_path_user_id
 from models import EventIn, TokenIn, ChatMessageIn, MemoryIn, AutonomyIn, ContextIn, RelationshipModeIn
@@ -80,6 +82,7 @@ from llm import (
 )
 from push import send_push_fcm
 from database import init_db, test_connection, db_available
+from robotics import step_robotics_frame, start_kiss
 
 logger = logging.getLogger(__name__)
 
@@ -575,6 +578,20 @@ def persist_assistant_output(
         update_channel_preferences_on_assistant_reply(u, modality)
         maybe_record_affective_event_from_assistant(u, text)
 
+    # Guardar timeline de articulação da primeira mensagem em voz para robótica
+    first = assistant_messages[0]
+    if first.get("modality") == "voice" and first.get("text"):
+        try:
+            speech_meta = text_to_speech_articulation(
+                text=first["text"],
+                emotion="neutral",
+                intensity=0.55,
+            )
+            u["last_speech_gesture_timeline"] = speech_meta.get("gesture_timeline")
+            u["last_speech_gesture_at_ms"] = now_ms()
+        except Exception as e:
+            logger.warning("robotics: failed to store speech timeline: %s", e)
+
     consolidate_emotional_narratives(u)
     set_typing(u, False)
 
@@ -858,16 +875,9 @@ def transcribe_audio_file(file_path: Path) -> str:
     return (data.get("text") or "").strip()
 
 
-def synthesize_speech(text: str) -> Optional[str]:
+def _synthesize_speech_openai(text: str, output_path: Path) -> bool:
     if not OPENAI_ENABLED or not OPENAI_API_KEY:
-        return None
-
-    if not text.strip():
-        return None
-
-    filename = f"{now_ms()}_{uuid.uuid4().hex}.mp3"
-    output_path = ASSISTANT_AUDIO_DIR / filename
-
+        return False
     response = requests.post(
         "https://api.openai.com/v1/audio/speech",
         headers={
@@ -881,14 +891,64 @@ def synthesize_speech(text: str) -> Optional[str]:
         },
         timeout=180
     )
-
     if response.status_code != 200:
-        return None
-
+        return False
     with open(output_path, "wb") as f:
         f.write(response.content)
+    return True
 
-    return media_url("assistant", filename)
+
+def _synthesize_speech_inworld(text: str, output_path: Path) -> bool:
+    if not INWORLD_API_KEY:
+        return False
+    response = requests.post(
+        "https://api.inworld.ai/tts/v1/voice",
+        headers={
+            "Authorization": f"Basic {INWORLD_API_KEY.strip()}",
+            "Content-Type": "application/json"
+        },
+        json={
+            "text": text[:2000],
+            "voiceId": INWORLD_TTS_VOICE_ID,
+            "modelId": INWORLD_TTS_MODEL_ID,
+            "audioConfig": {
+                "audioEncoding": "MP3",
+                "sampleRateHertz": 24000
+            },
+            "temperature": 1.0,
+            "applyTextNormalization": "ON"
+        },
+        timeout=180
+    )
+    if response.status_code != 200:
+        return False
+    data = response.json()
+    audio_b64 = data.get("audioContent")
+    if not audio_b64:
+        return False
+    with open(output_path, "wb") as f:
+        f.write(base64.b64decode(audio_b64))
+    return True
+
+
+def synthesize_speech(text: str) -> Optional[str]:
+    if not text.strip():
+        return None
+
+    use_inworld = TTS_PROVIDER == "inworld" and INWORLD_API_KEY
+    use_openai = (TTS_PROVIDER != "inworld" or not use_inworld) and OPENAI_ENABLED and OPENAI_API_KEY
+
+    if not use_inworld and not use_openai:
+        return None
+
+    filename = f"{now_ms()}_{uuid.uuid4().hex}.mp3"
+    output_path = ASSISTANT_AUDIO_DIR / filename
+
+    if use_inworld and _synthesize_speech_inworld(text, output_path):
+        return media_url("assistant", filename)
+    if use_openai and _synthesize_speech_openai(text, output_path):
+        return media_url("assistant", filename)
+    return None
 
 
 def save_user_audio(upload: UploadFile) -> tuple[Path, str]:
@@ -1957,6 +2017,41 @@ async def send_audio(
         source="audio",
         user_audio_url=uploaded_audio_url
     )
+
+
+# ----- Robotics (expressão facial, torso, fala, beijo) -----
+
+
+@router.get("/robotics/{user_id}/frame")
+def get_robotics_frame(
+    user_id: str = Depends(validate_path_user_id),
+    t_ms: int = Query(0, description="Tempo em ms para o frame (ou offset na fala)"),
+    speaking: bool = Query(False, description="True se o assistente está falando neste instante"),
+    speech_offset_ms: Optional[int] = Query(None, description="Offset em ms na timeline da última fala (sync com áudio)"),
+):
+    u = get_user(user_id)
+    ensure_current_mood(u)
+    frame = step_robotics_frame(
+        u,
+        t_ms,
+        speaking=speaking,
+        speech_offset_ms=speech_offset_ms,
+    )
+    return {"ok": True, "frame": frame}
+
+
+@router.post("/robotics/{user_id}/kiss")
+def trigger_kiss(
+    user_id: str = Depends(validate_path_user_id),
+    kiss_type: str = Body("peck", embed=True),
+    emotion: str = Body("affectionate", embed=True),
+    intensity: float = Body(0.5, embed=True),
+    cycles: int = Body(1, embed=True),
+):
+    u = get_user(user_id)
+    result = start_kiss(u, kiss_type=kiss_type, emotion=emotion, intensity=intensity, cycles=cycles)
+    save_state()
+    return result
 
 
 @router.post("/relationship_mode/{user_id}")
