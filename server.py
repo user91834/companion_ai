@@ -1,6 +1,7 @@
-from fastapi import FastAPI, Query, UploadFile, File
+from fastapi import APIRouter, FastAPI, Query, UploadFile, File, Depends, HTTPException, Body
 from fastapi.staticfiles import StaticFiles
 from typing import Dict, Any, Optional, List
+import logging
 import threading
 import time
 import os
@@ -10,11 +11,21 @@ from pathlib import Path
 import json
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from speech_articulation import text_to_speech_articulation
 
 import requests
 from openai import OpenAI
 
 from character_profile import CHARACTER_PROFILE
+from config import (
+    STATE_FILE, MEDIA_ROOT, USER_AUDIO_DIR, ASSISTANT_AUDIO_DIR,
+    PUBLIC_BASE_URL, OPENAI_API_KEY, OPENAI_ENABLED, OPENAI_MODEL,
+    DEFAULT_TIMEZONE, SUPPORTED_RELATIONSHIP_MODES,
+    MAX_CHAT_MESSAGES, PENDING_REPLY_BASE_DELAY_MS, PENDING_REPLY_MIN_DELAY_MS,
+    AUTOSAVE_INTERVAL_SEC, PROACTIVE_LOOP_INTERVAL_SEC, PENDING_REPLY_POLL_INTERVAL_SEC,
+    MAX_UPLOAD_AUDIO_BYTES, ALLOWED_AUDIO_MIME_TYPES,
+)
+from auth import validate_path_user_id
 from models import EventIn, TokenIn, ChatMessageIn, MemoryIn, AutonomyIn, ContextIn, RelationshipModeIn
 from utils import now_ms, clamp, day_key, normalize_text
 from memory import (
@@ -70,40 +81,20 @@ from llm import (
 from push import send_push_fcm
 from database import init_db, test_connection, db_available
 
+logger = logging.getLogger(__name__)
+
 app = FastAPI()
+router = APIRouter()
 
 STATE: Dict[str, Any] = {}
 STATE_LOCK = threading.Lock()
 THREADS_STARTED = False
 
 FCM_PROJECT_ID = os.environ.get("FCM_PROJECT_ID", "contextagent-cf19e")
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-nano")
-OPENAI_ENABLED = bool(os.environ.get("OPENAI_API_KEY"))
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_ENABLED else None
-
-RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
-PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL") or RENDER_EXTERNAL_URL
-
-DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-STATE_FILE = DATA_DIR / "state.json"
-
-MEDIA_ROOT = DATA_DIR / "media"
-USER_AUDIO_DIR = MEDIA_ROOT / "user"
-ASSISTANT_AUDIO_DIR = MEDIA_ROOT / "assistant"
 
 USER_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 ASSISTANT_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-
-DEFAULT_TIMEZONE = "America/Sao_Paulo"
-SUPPORTED_RELATIONSHIP_MODES = [
-    "friendship",
-    "friends_with_benefits",
-    "open_relationship",
-    "monogamous_relationship",
-]
 
 app.mount("/media", StaticFiles(directory=str(MEDIA_ROOT)), name="media")
 
@@ -119,7 +110,7 @@ def save_state():
             json.dump(STATE, f, ensure_ascii=False)
         os.replace(tmp_file, STATE_FILE)
     except Exception as e:
-        print("STATE SAVE ERROR:", e)
+        logger.exception("STATE SAVE ERROR: %s", e)
 
 
 def load_state():
@@ -132,7 +123,7 @@ def load_state():
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             STATE = json.load(f)
     except Exception as e:
-        print("STATE LOAD ERROR:", e)
+        logger.exception("STATE LOAD ERROR: %s", e)
 
 
 def get_timezone_name(u: Optional[Dict[str, Any]] = None) -> str:
@@ -373,8 +364,8 @@ def append_chat(
     elif role == "user":
         u.setdefault("operational_state", {})["last_user_message_at"] = ts
 
-    if len(u["chat"]) > 260:
-        del u["chat"][:-260]
+    if len(u["chat"]) > MAX_CHAT_MESSAGES:
+        del u["chat"][:-MAX_CHAT_MESSAGES]
 
 
 def mark_chat_read(u: Dict[str, Any]):
@@ -588,13 +579,23 @@ def persist_assistant_output(
     set_typing(u, False)
 
 
-def make_response_payload(
+def build_chat_response_payload(
     u: Dict[str, Any],
     assistant_messages: list[Dict[str, Any]],
     reply_plan: Dict[str, Any],
-):
+    *,
+    include_speech_meta: bool = True,
+) -> Dict[str, Any]:
     first = assistant_messages[0] if assistant_messages else None
     u["temporal_context"] = build_temporal_context(u)
+
+    speech_meta = None
+    if include_speech_meta and first and first.get("text"):
+        speech_meta = text_to_speech_articulation(
+            text=first["text"],
+            emotion="neutral",
+            intensity=0.55,
+        )
 
     return {
         "ok": True,
@@ -620,7 +621,16 @@ def make_response_payload(
         "daily_routine_legacy": u.get("daily_routine", {}),
         "current_mood": u.get("current_mood", {}),
         "emotion_v2": build_emotion_snapshot_v2(u),
+        "speech_meta": speech_meta,
     }
+
+
+def make_response_payload(
+    u: Dict[str, Any],
+    assistant_messages: list[Dict[str, Any]],
+    reply_plan: Dict[str, Any],
+):
+    return build_chat_response_payload(u, assistant_messages, reply_plan)
 
 
 def get_user(user_id: str) -> Dict[str, Any]:
@@ -795,7 +805,7 @@ def schedule_pending_reply(
         or "unknown"
     )    
 
-    base_delay = 1400
+    base_delay = PENDING_REPLY_BASE_DELAY_MS
 
     distance = float(current_mood.get("distance", 0.0))
     irritation = float(current_mood.get("irritation", 0.0))
@@ -815,7 +825,7 @@ def schedule_pending_reply(
     if reply_plan and reply_plan.get("response_mode") == "fragmented":
         base_delay += 500
 
-    base_delay = max(700, base_delay)
+    base_delay = max(PENDING_REPLY_MIN_DELAY_MS, base_delay)
 
     u["pending_replies"].append({
         "id": uuid.uuid4().hex,
@@ -892,6 +902,20 @@ def save_user_audio(upload: UploadFile) -> tuple[Path, str]:
     return file_path, media_url("user", filename)
 
 
+def save_user_audio_from_bytes(
+    body: bytes,
+    original_filename: Optional[str],
+    content_type: str,
+) -> tuple[Path, str]:
+    suffix = Path(original_filename or "").suffix or ".m4a"
+    if not suffix or suffix == ".":
+        suffix = ".m4a"
+    filename = f"{now_ms()}_{uuid.uuid4().hex}{suffix}"
+    file_path = USER_AUDIO_DIR / filename
+    file_path.write_bytes(body)
+    return file_path, media_url("user", filename)
+
+
 def process_user_text_message(
     u: Dict[str, Any],
     user_text: str,
@@ -962,31 +986,7 @@ def process_user_text_message(
 
     save_state()
 
-    return {
-        "ok": True,
-        "reply": None,
-        "assistant_audio_url": None,
-        "assistant_modality": None,
-        "assistant_messages": [],
-        "reply_plan": reply_plan,
-        "messages": u["chat"],
-        "llm_enabled": OPENAI_ENABLED,
-        "model": OPENAI_MODEL,
-        "memory_count": current_memory_count(u),
-        "episode_count": current_episode_count(u),
-        "relationship_structure": u.get("relationship_structure"),
-        "delivery_preferences": u.get("delivery_preferences"),
-        "user_profile": u.get("user_profile"),
-        "routine_profile": u.get("routine_profile"),
-        "temporal_context": u.get("temporal_context"),
-        "channel_preferences": u["channel_preferences"],
-        "assistant_typing": u["assistant_typing"],
-        "unread_assistant_count": u["unread_assistant_count"],
-        "pending_assistant": len(u["pending_replies"]) > 0,
-        "daily_routine_legacy": u.get("daily_routine", {}),
-        "current_mood": u.get("current_mood", {}),
-        "emotion_v2": build_emotion_snapshot_v2(u),
-    }
+    return build_chat_response_payload(u, [], reply_plan, include_speech_meta=False)
 
 
 def should_send_proactive_push(u: Dict[str, Any]) -> bool:
@@ -1053,89 +1053,96 @@ def has_sent_push_id(u: Dict[str, Any], push_id: str) -> bool:
 
 def process_pending_replies():
     while True:
-        time.sleep(0.7)
+        try:
+            time.sleep(PENDING_REPLY_POLL_INTERVAL_SEC)
 
-        with STATE_LOCK:
-            user_ids = list(STATE.keys())
-
-        for user_id in user_ids:
             with STATE_LOCK:
-                u = STATE.get(user_id)
-                if not u:
-                    continue
+                user_ids = list(STATE.keys())
 
-                if not u["pending_replies"]:
-                    if u.get("assistant_typing"):
+            for user_id in user_ids:
+                with STATE_LOCK:
+                    u = STATE.get(user_id)
+                    if not u:
+                        continue
+
+                    if not u["pending_replies"]:
+                        if u.get("assistant_typing"):
+                            set_typing(u, False)
+                        continue
+
+                    ready = pop_ready_pending_replies(u)
+                    if not ready:
+                        continue
+
+                    set_typing(u, True)
+
+                for p in ready:
+                    with STATE_LOCK:
+                        u = STATE.get(user_id)
+                        if not u:
+                            continue
+
+                    reply_plan = p.get("reply_plan") or {
+                        "response_mode": "single",
+                        "modality": "text",
+                        "audio_length": "short",
+                        "reflective_long": False,
+                        "allow_later_initiative": True,
+                    }
+
+                    assistant_messages = generate_reply_sequence(
+                        u,
+                        p["user_text"],
+                        reply_plan,
+                        p.get("source", "chat")
+                    )
+
+                    with STATE_LOCK:
+                        u = STATE.get(user_id)
+                        if not u:
+                            continue
+
+                        persist_assistant_output(u, assistant_messages, reply_plan)
+                        save_state()
+
+                        token = u.get("fcm_token")
+                        pending_id = p.get("id") or uuid.uuid4().hex
+
+                        if token and assistant_messages and should_send_proactive_push(u) and not has_sent_push_id(u, pending_id):
+                            try:
+                                r = send_push_fcm(token, "Evelyn 💛", assistant_messages[0]["text"])
+                                if getattr(r, "status_code", 0) == 200:
+                                    register_sent_push_id(u, pending_id)
+                                    u["last_push_ts_ms"] = now_ms()
+                                    u["last_push_text"] = assistant_messages[0]["text"]
+                                    u["pushes_today"] = u.get("pushes_today", 0) + 1
+                                    u["pushes_day_key"] = day_key()
+
+                                    u["operational_state"]["last_push_at"] = u["last_push_ts_ms"]
+                                    u["operational_state"]["daily_push_count"] = u["pushes_today"]
+                                    u["operational_state"]["push_day_key"] = u["pushes_day_key"]
+
+                                    save_state()
+                                else:
+                                    logger.warning(
+                                        "PENDING PUSH NON-200: %s %s",
+                                        getattr(r, "status_code", None),
+                                        getattr(r, "text", "")[:300],
+                                    )
+                            except Exception as e:
+                                logger.exception("PENDING PUSH ERROR: %s", e)
+
+                with STATE_LOCK:
+                    u = STATE.get(user_id)
+                    if u and not u["pending_replies"]:
                         set_typing(u, False)
-                    continue
-
-                ready = pop_ready_pending_replies(u)
-                if not ready:
-                    continue
-
-                set_typing(u, True)
-
-            for p in ready:
-                with STATE_LOCK:
-                    u = STATE.get(user_id)
-                    if not u:
-                        continue
-
-                reply_plan = p.get("reply_plan") or {
-                    "response_mode": "single",
-                    "modality": "text",
-                    "audio_length": "short",
-                    "reflective_long": False,
-                    "allow_later_initiative": True,
-                }
-
-                assistant_messages = generate_reply_sequence(
-                    u,
-                    p["user_text"],
-                    reply_plan,
-                    p.get("source", "chat")
-                )
-
-                with STATE_LOCK:
-                    u = STATE.get(user_id)
-                    if not u:
-                        continue
-
-                    persist_assistant_output(u, assistant_messages, reply_plan)
-                    save_state()
-
-                    token = u.get("fcm_token")
-                    pending_id = p.get("id") or uuid.uuid4().hex
-
-                    if token and assistant_messages and should_send_proactive_push(u) and not has_sent_push_id(u, pending_id):
-                        try:
-                            r = send_push_fcm(token, "Evelyn 💛", assistant_messages[0]["text"])
-                            if getattr(r, "status_code", 0) == 200:
-                                register_sent_push_id(u, pending_id)
-                                u["last_push_ts_ms"] = now_ms()
-                                u["last_push_text"] = assistant_messages[0]["text"]
-                                u["pushes_today"] = u.get("pushes_today", 0) + 1
-                                u["pushes_day_key"] = day_key()
-
-                                u["operational_state"]["last_push_at"] = u["last_push_ts_ms"]
-                                u["operational_state"]["daily_push_count"] = u["pushes_today"]
-                                u["operational_state"]["push_day_key"] = u["pushes_day_key"]
-
-                                save_state()
-                            else:
-                                print("PENDING PUSH NON-200:", getattr(r, "status_code", None), getattr(r, "text", "")[:300])
-                        except Exception as e:
-                            print("PENDING PUSH ERROR:", e)
-
-            with STATE_LOCK:
-                u = STATE.get(user_id)
-                if u and not u["pending_replies"]:
-                    set_typing(u, False)
+        except Exception as e:
+            logger.exception("process_pending_replies error: %s", e)
 
 
 def maybe_send_proactive_messages():
     while True:
-        time.sleep(20)
+        time.sleep(PROACTIVE_LOOP_INTERVAL_SEC)
 
         try:
             with STATE_LOCK:
@@ -1208,12 +1215,14 @@ def maybe_send_proactive_messages():
                     token = u.get("fcm_token")
                     delivery_mode = u.get("delivery_preferences", {}).get("inactive_delivery_mode", "text")
                     allow_background_audio = bool(u.get("delivery_preferences", {}).get("allow_background_audio", False))
-
                     use_voice = (
                         allow_background_audio
                         and delivery_mode in ("audio", "both")
                         and should_proactive_be_voice(u)
                     )
+
+                if not token:
+                    continue
 
                 if use_voice:
                     text = generate_llm_proactive_voice_message(
@@ -1241,11 +1250,15 @@ def maybe_send_proactive_messages():
                 try:
                     r = send_push_fcm(token, "Evelyn 💛", text)
                 except Exception as e:
-                    print("FCM SEND ERROR:", e)
+                    logger.exception("FCM SEND ERROR: %s", e)
                     continue
 
                 if getattr(r, "status_code", 0) != 200:
-                    print("FCM NON-200:", getattr(r, "status_code", None), getattr(r, "text", "")[:300])
+                    logger.warning(
+                        "FCM NON-200: %s %s",
+                        getattr(r, "status_code", None),
+                        getattr(r, "text", "")[:300],
+                    )
                     continue
 
                 with STATE_LOCK:
@@ -1284,14 +1297,17 @@ def maybe_send_proactive_messages():
                     save_state()
 
         except Exception as e:
-            print("Proactive loop error:", e)
+            logger.exception("Proactive loop error: %s", e)
 
 
 def autosave_loop():
     while True:
-        time.sleep(20)
-        with STATE_LOCK:
-            save_state()
+        try:
+            time.sleep(AUTOSAVE_INTERVAL_SEC)
+            with STATE_LOCK:
+                save_state()
+        except Exception as e:
+            logger.exception("Autosave loop error: %s", e)
 
 
 def _merge_delivery_preferences(u: Dict[str, Any], payload: Dict[str, Any]):
@@ -1338,8 +1354,8 @@ def _merge_routine_profile(u: Dict[str, Any], payload: Dict[str, Any]):
     routine["last_updated_at"] = now_ms()
 
 
-@app.get("/routine_profile/{user_id}")
-def get_routine_profile(user_id: str):
+@router.get("/routine_profile/{user_id}")
+def get_routine_profile(user_id: str = Depends(validate_path_user_id)):
     u = get_user(user_id)
     return {
         "ok": True,
@@ -1347,8 +1363,11 @@ def get_routine_profile(user_id: str):
     }
 
 
-@app.post("/routine_profile/{user_id}")
-def set_routine_profile(user_id: str, payload: Dict[str, Any]):
+@router.post("/routine_profile/{user_id}")
+def set_routine_profile(
+    user_id: str = Depends(validate_path_user_id),
+    payload: Dict[str, Any] = Body(...),
+):
     u = get_user(user_id)
 
     previous = dict(u.get("routine_profile", {}))
@@ -1383,8 +1402,8 @@ def set_routine_profile(user_id: str, payload: Dict[str, Any]):
     }
 
 
-@app.get("/delivery_preferences/{user_id}")
-def get_delivery_preferences(user_id: str):
+@router.get("/delivery_preferences/{user_id}")
+def get_delivery_preferences(user_id: str = Depends(validate_path_user_id)):
     u = get_user(user_id)
     return {
         "ok": True,
@@ -1392,8 +1411,11 @@ def get_delivery_preferences(user_id: str):
     }
 
 
-@app.post("/delivery_preferences/{user_id}")
-def set_delivery_preferences(user_id: str, payload: Dict[str, Any]):
+@router.post("/delivery_preferences/{user_id}")
+def set_delivery_preferences(
+    user_id: str = Depends(validate_path_user_id),
+    payload: Dict[str, Any] = Body(...),
+):
     u = get_user(user_id)
 
     previous = dict(u.get("delivery_preferences", {}))
@@ -1443,7 +1465,7 @@ def startup_threads():
         THREADS_STARTED = True
 
 
-@app.get("/ping")
+@router.get("/ping")
 def ping():
     return {
         "ok": True,
@@ -1456,7 +1478,22 @@ def ping():
     }
 
 
-@app.get("/test-db")
+@router.get("/health")
+def health():
+    """Health check for load balancers; includes DB connectivity when configured."""
+    out = {"ok": True, "ts_ms": now_ms()}
+    if db_available():
+        try:
+            test_connection()
+            out["database"] = "ok"
+        except Exception as e:
+            logger.warning("Health check DB error: %s", e)
+            out["database"] = "error"
+            out["database_error"] = str(e)
+    return out
+
+
+@router.get("/test-db")
 def test_db():
     if not db_available():
         return {"ok": False, "error": "DATABASE_URL not configured"}
@@ -1465,8 +1502,8 @@ def test_db():
     return {"ok": True, "result": list(result) if result else None}
 
 
-@app.get("/autonomy/{user_id}")
-def get_autonomy(user_id: str):
+@router.get("/autonomy/{user_id}")
+def get_autonomy(user_id: str = Depends(validate_path_user_id)):
     u = get_user(user_id)
     return {
         "autonomy_settings": u["autonomy_settings"],
@@ -1481,8 +1518,11 @@ def get_autonomy(user_id: str):
     }
 
 
-@app.post("/autonomy/{user_id}")
-def set_autonomy(user_id: str, data: AutonomyIn):
+@router.post("/autonomy/{user_id}")
+def set_autonomy(
+    user_id: str = Depends(validate_path_user_id),
+    data: AutonomyIn = Body(...),
+):
     u = get_user(user_id)
     u["autonomy_settings"]["interruptions_enabled"] = data.interruptions_enabled
     u["autonomy_settings"]["scarcity_level"] = clamp(data.scarcity_level)
@@ -1491,8 +1531,8 @@ def set_autonomy(user_id: str, data: AutonomyIn):
     return {"ok": True, "autonomy_settings": u["autonomy_settings"]}
 
 
-@app.get("/routine/{user_id}")
-def get_routine(user_id: str):
+@router.get("/routine/{user_id}")
+def get_routine(user_id: str = Depends(validate_path_user_id)):
     u = get_user(user_id)
     u["temporal_context"] = build_temporal_context(u)
     return {
@@ -1506,8 +1546,8 @@ def get_routine(user_id: str):
     }
 
 
-@app.get("/narratives/{user_id}")
-def get_narratives(user_id: str):
+@router.get("/narratives/{user_id}")
+def get_narratives(user_id: str = Depends(validate_path_user_id)):
     u = get_user(user_id)
     return {
         "count": len(u["emotional_narratives"]),
@@ -1515,8 +1555,8 @@ def get_narratives(user_id: str):
     }
 
 
-@app.get("/unread/{user_id}")
-def unread(user_id: str):
+@router.get("/unread/{user_id}")
+def unread(user_id: str = Depends(validate_path_user_id)):
     u = get_user(user_id)
     u["temporal_context"] = build_temporal_context(u)
     return {
@@ -1530,21 +1570,27 @@ def unread(user_id: str):
     }
 
 
-@app.get("/memory_search/{user_id}")
-def memory_search(user_id: str, q: str = Query(default="")):
+@router.get("/memory_search/{user_id}")
+def memory_search(
+    user_id: str = Depends(validate_path_user_id),
+    q: str = Query(default=""),
+):
     u = get_user(user_id)
     memories = get_semantic_memories(u, q, limit=12)
     return {"query": q, "count": len(memories), "results": memories}
 
 
-@app.get("/episodes/{user_id}")
-def get_episodes(user_id: str, q: str = Query(default="")):
+@router.get("/episodes/{user_id}")
+def get_episodes(
+    user_id: str = Depends(validate_path_user_id),
+    q: str = Query(default=""),
+):
     u = get_user(user_id)
     episodes = get_relevant_episodes(u, q, limit=12) if q else current_episodes(u, limit=12)
     return {"query": q, "count": len(episodes), "episodes": episodes}
 
 
-@app.post("/event")
+@router.post("/event")
 def receive_event(e: EventIn):
     u = get_user(e.user_id)
     decay_emotions(u)
@@ -1638,7 +1684,7 @@ def receive_event(e: EventIn):
     return {"ok": True}
 
 
-@app.post("/context")
+@router.post("/context")
 def receive_context(ctx: ContextIn):
     u = get_user(ctx.user_id)
     decay_emotions(u)
@@ -1689,8 +1735,8 @@ def receive_context(ctx: ContextIn):
     }
 
 
-@app.get("/state/{user_id}")
-def state(user_id: str):
+@router.get("/state/{user_id}")
+def state(user_id: str = Depends(validate_path_user_id)):
     u = get_user(user_id)
     apply_time_update_v2(u)
     u["temporal_context"] = build_temporal_context(u)
@@ -1710,8 +1756,8 @@ def state(user_id: str):
     }
 
 
-@app.get("/last/{user_id}")
-def last(user_id: str):
+@router.get("/last/{user_id}")
+def last(user_id: str = Depends(validate_path_user_id)):
     u = get_user(user_id)
     apply_time_update_v2(u)
     u["temporal_context"] = build_temporal_context(u)
@@ -1746,7 +1792,7 @@ def last(user_id: str):
     }
 
 
-@app.post("/register_token")
+@router.post("/register_token")
 def register_token(t: TokenIn):
     u = get_user(t.user_id)
     u["fcm_token"] = t.fcm_token
@@ -1765,8 +1811,11 @@ def register_token(t: TokenIn):
     return {"ok": True}
 
 
-@app.post("/set_name/{user_id}")
-def set_user_name(user_id: str, name: str):
+@router.post("/set_name/{user_id}")
+def set_user_name(
+    user_id: str = Depends(validate_path_user_id),
+    name: str = Query(...),
+):
     u = get_user(user_id)
 
     clean = name.strip()[:80]
@@ -1805,23 +1854,26 @@ def set_user_name(user_id: str, name: str):
     }
 
 
-@app.get("/name/{user_id}")
-def get_user_name(user_id: str):
+@router.get("/name/{user_id}")
+def get_user_name(user_id: str = Depends(validate_path_user_id)):
     u = get_user(user_id)
     return {
         "user_name": u.get("identity", {}).get("display_name", "") or u.get("user_name", "")
     }
 
 
-@app.get("/memories/{user_id}")
-def get_memories(user_id: str):
+@router.get("/memories/{user_id}")
+def get_memories(user_id: str = Depends(validate_path_user_id)):
     u = get_user(user_id)
     memories = current_memories(u)
     return {"count": len(memories), "memories": memories}
 
 
-@app.post("/memories/{user_id}")
-def add_memory_endpoint(user_id: str, mem: MemoryIn):
+@router.post("/memories/{user_id}")
+def add_memory_endpoint(
+    user_id: str = Depends(validate_path_user_id),
+    mem: MemoryIn = Body(...),
+):
     u = get_user(user_id)
     add_memory(u, mem.text, kind=mem.kind or "fact")
     consolidate_emotional_narratives(u)
@@ -1831,8 +1883,8 @@ def add_memory_endpoint(user_id: str, mem: MemoryIn):
     return {"ok": True, "count": len(memories), "memories": memories}
 
 
-@app.get("/chat/{user_id}")
-def get_chat(user_id: str):
+@router.get("/chat/{user_id}")
+def get_chat(user_id: str = Depends(validate_path_user_id)):
     u = get_user(user_id)
     mark_chat_read(u)
     u["temporal_context"] = build_temporal_context(u)
@@ -1850,8 +1902,11 @@ def get_chat(user_id: str):
     }
 
 
-@app.post("/chat/{user_id}/send")
-def send_chat(user_id: str, msg: ChatMessageIn):
+@router.post("/chat/{user_id}/send")
+def send_chat(
+    user_id: str = Depends(validate_path_user_id),
+    msg: ChatMessageIn = Body(...),
+):
     u = get_user(user_id)
     decay_emotions(u)
     update_drives_passive(u)
@@ -1869,14 +1924,28 @@ def send_chat(user_id: str, msg: ChatMessageIn):
     )
 
 
-@app.post("/chat/{user_id}/send_audio")
-async def send_audio(user_id: str, file: UploadFile = File(...)):
+@router.post("/chat/{user_id}/send_audio")
+async def send_audio(
+    user_id: str = Depends(validate_path_user_id),
+    file: UploadFile = File(...),
+):
+    content_type = (file.content_type or "").strip().lower()
+    if content_type and content_type not in ALLOWED_AUDIO_MIME_TYPES:
+        raise HTTPException(status_code=415, detail=f"Unsupported audio type: {content_type}")
+    body = await file.read()
+    if len(body) > MAX_UPLOAD_AUDIO_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Audio file too large (max {MAX_UPLOAD_AUDIO_BYTES} bytes)",
+        )
     u = get_user(user_id)
     decay_emotions(u)
     update_drives_passive(u)
     apply_time_update_v2(u)
 
-    saved_path, uploaded_audio_url = save_user_audio(file)
+    saved_path, uploaded_audio_url = save_user_audio_from_bytes(
+        body, getattr(file, "filename", None), content_type
+    )
     transcript = transcribe_audio_file(saved_path)
 
     if not transcript:
@@ -1890,8 +1959,11 @@ async def send_audio(user_id: str, file: UploadFile = File(...)):
     )
 
 
-@app.post("/relationship_mode/{user_id}")
-def set_relationship_mode(user_id: str, data: RelationshipModeIn):
+@router.post("/relationship_mode/{user_id}")
+def set_relationship_mode(
+    user_id: str = Depends(validate_path_user_id),
+    data: RelationshipModeIn = Body(...),
+):
     u = get_user(user_id)
 
     mode = data.mode
@@ -1938,3 +2010,7 @@ def set_relationship_mode(user_id: str, data: RelationshipModeIn):
         "ok": True,
         "relationship_structure": u["relationship_structure"],
     }
+
+
+app.include_router(router)
+app.include_router(router, prefix="/v1")

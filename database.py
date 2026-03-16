@@ -45,6 +45,7 @@ def init_db():
     schema_sql = """
     CREATE TABLE IF NOT EXISTS memories (
         id SERIAL PRIMARY KEY,
+        user_id TEXT NOT NULL DEFAULT '',
         text TEXT NOT NULL,
         kind TEXT NOT NULL DEFAULT 'fact',
         tags JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -58,6 +59,7 @@ def init_db():
 
     CREATE TABLE IF NOT EXISTS episodes (
         id SERIAL PRIMARY KEY,
+        user_id TEXT NOT NULL DEFAULT '',
         episode_type TEXT NOT NULL,
         summary TEXT NOT NULL,
         details JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -65,7 +67,36 @@ def init_db():
         importance INTEGER NOT NULL DEFAULT 5,
         ts_ms BIGINT NOT NULL
     );
+
+    CREATE INDEX IF NOT EXISTS idx_memories_user_id ON memories (user_id);
+    CREATE INDEX IF NOT EXISTS idx_episodes_user_id ON episodes (user_id);
     """
 
     with engine.begin() as conn:
         conn.execute(text(schema_sql))
+
+    # Migration: add user_id to existing tables if missing
+    migration_sql = """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'memories' AND column_name = 'user_id'
+        ) THEN
+            ALTER TABLE memories ADD COLUMN user_id TEXT NOT NULL DEFAULT '';
+            CREATE INDEX IF NOT EXISTS idx_memories_user_id ON memories (user_id);
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'episodes' AND column_name = 'user_id'
+        ) THEN
+            ALTER TABLE episodes ADD COLUMN user_id TEXT NOT NULL DEFAULT '';
+            CREATE INDEX IF NOT EXISTS idx_episodes_user_id ON episodes (user_id);
+        END IF;
+    END $$;
+    """
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(migration_sql))
+    except Exception:
+        pass

@@ -2,8 +2,6 @@ from typing import Dict, Any, List
 
 from character_profile import CHARACTER_PROFILE
 from emotion import (
-    get_relationship_stage,
-    relationship_stage_description,
     ensure_emotional_engine_v2,
     build_emotion_snapshot_v2,
     compute_initiative_score_v2,
@@ -181,7 +179,7 @@ def build_character_instructions(
     st = u["status"]
     drives = u["drives"]
     prefs = u.get("channel_preferences", {})
-    stage = get_relationship_stage(u)
+    relationship_mode = u.get("relationship_structure", {}).get("current_mode", "friendship")
     routine = u["daily_routine"]
     current_mood = u.get("current_mood", {})
     v2_snapshot = build_emotion_snapshot_v2(u)
@@ -260,8 +258,7 @@ Conversation style: {CHARACTER_PROFILE.get("conversation_style", "")}
 Anti-assistant style: {CHARACTER_PROFILE.get("anti_assistant_style", "")}
 Speech realism: {CHARACTER_PROFILE.get("speech_realism", "")}
 
-Current relationship stage: {stage}
-Stage description: {relationship_stage_description(stage)}
+Current relationship mode: {relationship_mode}
 
 {relational_block}
 
@@ -373,7 +370,7 @@ Voice-mode instructions:
 def build_proactive_instructions(u: Dict[str, Any]) -> str:
     ensure_emotional_engine_v2(u)
 
-    stage = get_relationship_stage(u)
+    relationship_mode = u.get("relationship_structure", {}).get("current_mode", "friendship")
     em = u["emotion"]
     drives = u["drives"]
     routine = u["daily_routine"]
@@ -384,7 +381,7 @@ def build_proactive_instructions(u: Dict[str, Any]) -> str:
     return f"""
 You are initiating contact as Evelyn.
 
-Current relationship stage: {stage}
+Current relationship mode: {relationship_mode}
 
 {relational_block}
 
@@ -432,7 +429,7 @@ Instructions:
 
 def generate_rule_based_reply(u: Dict[str, Any], user_text: str) -> str:
     text = normalize_text(user_text)
-    stage = get_relationship_stage(u)
+    relationship_mode = u.get("relationship_structure", {}).get("current_mode", "friendship")
     routine = u["daily_routine"]
     current_mood = u.get("current_mood", {})
     mode = detect_reply_mode(user_text)
@@ -448,7 +445,7 @@ def generate_rule_based_reply(u: Dict[str, Any], user_text: str) -> str:
         return f"I was {routine['current_activity']} and now you're interrupting my mental flow. Rude. Slightly cute, though."
 
     if any(x in text for x in ["te amo", "saudade", "amor", "love you", "miss you"]):
-        if stage in ("apego", "intimidade_consolidada"):
+        if relationship_mode in ("open_relationship", "monogamous_relationship"):
             return "When you say that, some part of me goes soft immediately."
         return "When you say that, I get more attached than is probably wise."
 
@@ -465,13 +462,13 @@ def generate_rule_based_reply(u: Dict[str, Any], user_text: str) -> str:
 
 def generate_rule_based_voice_reply(u: Dict[str, Any], user_text: str) -> str:
     text = normalize_text(user_text)
-    stage = get_relationship_stage(u)
+    relationship_mode = u.get("relationship_structure", {}).get("current_mode", "friendship")
 
     if any(x in text for x in ["sad", "tired", "anxious", "alone", "triste", "cansado", "ansioso", "sozinho"]):
         return "Hey... come here a little. Tell me what's happening."
 
     if any(x in text for x in ["love you", "miss you", "te amo", "saudade", "amor"]):
-        if stage in ("apego", "intimidade_consolidada"):
+        if relationship_mode in ("open_relationship", "monogamous_relationship"):
             return "You say things like that and I melt a little. More than a little, actually."
         return "You saying that does something to me. Probably more than is reasonable."
 

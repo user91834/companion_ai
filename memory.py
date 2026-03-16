@@ -139,12 +139,17 @@ def _memory_type_matches(item: Dict[str, Any], target_kind: Optional[str]) -> bo
 # DB LAYER
 # =========================================================
 
-def _db_insert_memory(item: Dict[str, Any]):
+def _user_id(u: Dict[str, Any]) -> str:
+    return (u.get("identity") or {}).get("user_id", "")
+
+
+def _db_insert_memory(item: Dict[str, Any], user_id: str):
     if not db_available():
         return
 
     sql = text("""
         INSERT INTO memories (
+            user_id,
             text,
             kind,
             tags,
@@ -156,6 +161,7 @@ def _db_insert_memory(item: Dict[str, Any]):
             ts_ms
         )
         VALUES (
+            :user_id,
             :text,
             :kind,
             CAST(:tags AS jsonb),
@@ -172,6 +178,7 @@ def _db_insert_memory(item: Dict[str, Any]):
         conn.execute(
             sql,
             {
+                "user_id": user_id,
                 "text": item.get("text", ""),
                 "kind": _normalize_kind(item.get("kind", "semantic")),
                 "tags": json.dumps(item.get("tags", [])),
@@ -185,7 +192,7 @@ def _db_insert_memory(item: Dict[str, Any]):
         )
 
 
-def _db_update_existing_memory(existing_id: int, item: Dict[str, Any]):
+def _db_update_existing_memory(existing_id: int, item: Dict[str, Any], user_id: str):
     if not db_available():
         return
 
@@ -200,7 +207,7 @@ def _db_update_existing_memory(existing_id: int, item: Dict[str, Any]):
             pinned = :pinned,
             meta = CAST(:meta AS jsonb),
             ts_ms = :ts_ms
-        WHERE id = :id
+        WHERE id = :id AND user_id = :user_id
     """)
 
     with engine.begin() as conn:
@@ -208,6 +215,7 @@ def _db_update_existing_memory(existing_id: int, item: Dict[str, Any]):
             sql,
             {
                 "id": existing_id,
+                "user_id": user_id,
                 "kind": _normalize_kind(item.get("kind", "semantic")),
                 "tags": json.dumps(item.get("tags", [])),
                 "importance": int(item.get("importance", 3)),
@@ -220,21 +228,24 @@ def _db_update_existing_memory(existing_id: int, item: Dict[str, Any]):
         )
 
 
-def _db_find_recent_duplicate_memory(norm_text: str, kind: Optional[str] = None, limit: int = 80) -> Optional[Dict[str, Any]]:
+def _db_find_recent_duplicate_memory(
+    norm_text: str, user_id: str, kind: Optional[str] = None, limit: int = 80
+) -> Optional[Dict[str, Any]]:
     if not db_available():
         return None
 
     normalized_kind = _normalize_kind(kind) if kind else None
 
+    kind_clause = " AND kind = :kind" if normalized_kind else ""
     sql = text(f"""
         SELECT id, text, kind, tags, importance, valence, intensity, pinned, meta, ts_ms
         FROM memories
-        {"WHERE kind = :kind" if normalized_kind else ""}
+        WHERE user_id = :user_id{kind_clause}
         ORDER BY ts_ms DESC
         LIMIT :limit
     """)
 
-    params = {"limit": limit}
+    params: Dict[str, Any] = {"user_id": user_id, "limit": limit}
     if normalized_kind:
         params["kind"] = normalized_kind
 
@@ -251,12 +262,13 @@ def _db_find_recent_duplicate_memory(norm_text: str, kind: Optional[str] = None,
     return None
 
 
-def _db_insert_episode(item: Dict[str, Any]):
+def _db_insert_episode(item: Dict[str, Any], user_id: str):
     if not db_available():
         return
 
     sql = text("""
         INSERT INTO episodes (
+            user_id,
             episode_type,
             summary,
             details,
@@ -265,6 +277,7 @@ def _db_insert_episode(item: Dict[str, Any]):
             ts_ms
         )
         VALUES (
+            :user_id,
             :episode_type,
             :summary,
             CAST(:details AS jsonb),
@@ -278,6 +291,7 @@ def _db_insert_episode(item: Dict[str, Any]):
         conn.execute(
             sql,
             {
+                "user_id": user_id,
                 "episode_type": item.get("type", "general"),
                 "summary": item.get("summary", ""),
                 "details": json.dumps(item.get("details", {})),
@@ -288,16 +302,17 @@ def _db_insert_episode(item: Dict[str, Any]):
         )
 
 
-def _db_load_memories(limit: Optional[int] = None) -> List[Dict[str, Any]]:
+def _db_load_memories(user_id: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
     if not db_available():
         return []
 
     sql = """
         SELECT id, text, kind, tags, importance, valence, intensity, pinned, meta, ts_ms
         FROM memories
+        WHERE user_id = :user_id
         ORDER BY ts_ms DESC
     """
-    params: Dict[str, Any] = {}
+    params: Dict[str, Any] = {"user_id": user_id}
 
     if limit is not None:
         sql += " LIMIT :limit"
@@ -318,16 +333,17 @@ def _db_load_memories(limit: Optional[int] = None) -> List[Dict[str, Any]]:
     return result
 
 
-def _db_load_episodes(limit: Optional[int] = None) -> List[Dict[str, Any]]:
+def _db_load_episodes(user_id: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
     if not db_available():
         return []
 
     sql = """
         SELECT id, episode_type, summary, details, tags, importance, ts_ms
         FROM episodes
+        WHERE user_id = :user_id
         ORDER BY ts_ms DESC
     """
-    params: Dict[str, Any] = {}
+    params: Dict[str, Any] = {"user_id": user_id}
 
     if limit is not None:
         sql += " LIMIT :limit"
@@ -352,15 +368,16 @@ def _db_load_episodes(limit: Optional[int] = None) -> List[Dict[str, Any]]:
     return result
 
 
-def _db_trim_memories():
+def _db_trim_memories(user_id: str):
     if not db_available():
         return
 
     sql = text("""
         DELETE FROM memories
-        WHERE id IN (
+        WHERE user_id = :user_id AND id IN (
             SELECT id
             FROM memories
+            WHERE user_id = :user_id
             ORDER BY
                 pinned DESC,
                 importance DESC,
@@ -371,37 +388,38 @@ def _db_trim_memories():
     """)
 
     with engine.begin() as conn:
-        conn.execute(sql, {"keep_count": MAX_MEMORIES})
+        conn.execute(sql, {"user_id": user_id, "keep_count": MAX_MEMORIES})
 
 
-def _db_trim_episodes():
+def _db_trim_episodes(user_id: str):
     if not db_available():
         return
 
     sql = text("""
         DELETE FROM episodes
-        WHERE id IN (
+        WHERE user_id = :user_id AND id IN (
             SELECT id
             FROM episodes
+            WHERE user_id = :user_id
             ORDER BY importance DESC, ts_ms DESC
             OFFSET :keep_count
         )
     """)
 
     with engine.begin() as conn:
-        conn.execute(sql, {"keep_count": MAX_EPISODES})
+        conn.execute(sql, {"user_id": user_id, "keep_count": MAX_EPISODES})
 
 
 def _get_memory_source(u: Dict[str, Any]) -> List[Dict[str, Any]]:
     if db_available():
-        return _db_load_memories()
+        return _db_load_memories(_user_id(u))
     _ensure_user_memory_state(u)
     return u["memories"]
 
 
 def _get_episode_source(u: Dict[str, Any]) -> List[Dict[str, Any]]:
     if db_available():
-        return _db_load_episodes()
+        return _db_load_episodes(_user_id(u))
     _ensure_user_memory_state(u)
     return u["episodes"]
 
@@ -442,9 +460,10 @@ def add_memory(
     }
 
     norm = normalize_text(item["text"])
+    uid = _user_id(u)
 
     if db_available():
-        existing = _db_find_recent_duplicate_memory(norm, kind=None, limit=80)
+        existing = _db_find_recent_duplicate_memory(norm, uid, kind=None, limit=80)
         if existing:
             existing["ts_ms"] = now_ms()
             existing["kind"] = normalized_kind or existing.get("kind", "semantic")
@@ -458,11 +477,11 @@ def add_memory(
             existing_meta.update(item.get("meta", {}))
             existing["meta"] = existing_meta
 
-            _db_update_existing_memory(existing_id=existing["id"], item=existing)
+            _db_update_existing_memory(existing_id=existing["id"], item=existing, user_id=uid)
             return
 
-        _db_insert_memory(item)
-        _db_trim_memories()
+        _db_insert_memory(item, uid)
+        _db_trim_memories(uid)
         return
 
     for m in reversed(u["memories"][-60:]):
@@ -672,8 +691,8 @@ def add_episode(
     }
 
     if db_available():
-        _db_insert_episode(item)
-        _db_trim_episodes()
+        _db_insert_episode(item, _user_id(u))
+        _db_trim_episodes(_user_id(u))
         return
 
     u["episodes"].append(item)
@@ -940,7 +959,7 @@ def get_relevant_episodes(u: Dict[str, Any], query: str, limit: int = 8) -> List
 
 def get_all_memories(u: Dict[str, Any], limit: Optional[int] = None) -> List[Dict[str, Any]]:
     if db_available():
-        items = _db_load_memories(limit=limit)
+        items = _db_load_memories(_user_id(u), limit=limit)
         return list(reversed(items))
     _ensure_user_memory_state(u)
     return u["memories"][:] if limit is None else u["memories"][-limit:]
@@ -948,7 +967,7 @@ def get_all_memories(u: Dict[str, Any], limit: Optional[int] = None) -> List[Dic
 
 def get_all_episodes(u: Dict[str, Any], limit: Optional[int] = None) -> List[Dict[str, Any]]:
     if db_available():
-        items = _db_load_episodes(limit=limit)
+        items = _db_load_episodes(_user_id(u), limit=limit)
         return list(reversed(items))
     _ensure_user_memory_state(u)
     return u["episodes"][:] if limit is None else u["episodes"][-limit:]
@@ -956,9 +975,9 @@ def get_all_episodes(u: Dict[str, Any], limit: Optional[int] = None) -> List[Dic
 
 def get_memory_count(u: Dict[str, Any]) -> int:
     if db_available():
-        sql = text("SELECT COUNT(*) AS count FROM memories")
+        sql = text("SELECT COUNT(*) AS count FROM memories WHERE user_id = :user_id")
         with engine.begin() as conn:
-            row = conn.execute(sql).mappings().first()
+            row = conn.execute(sql, {"user_id": _user_id(u)}).mappings().first()
         return int(row["count"]) if row else 0
     _ensure_user_memory_state(u)
     return len(u["memories"])
@@ -966,9 +985,9 @@ def get_memory_count(u: Dict[str, Any]) -> int:
 
 def get_episode_count(u: Dict[str, Any]) -> int:
     if db_available():
-        sql = text("SELECT COUNT(*) AS count FROM episodes")
+        sql = text("SELECT COUNT(*) AS count FROM episodes WHERE user_id = :user_id")
         with engine.begin() as conn:
-            row = conn.execute(sql).mappings().first()
+            row = conn.execute(sql, {"user_id": _user_id(u)}).mappings().first()
         return int(row["count"]) if row else 0
     _ensure_user_memory_state(u)
     return len(u["episodes"])
