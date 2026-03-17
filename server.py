@@ -357,7 +357,8 @@ def append_chat(
     role: str,
     text: str,
     audio_url: Optional[str] = None,
-    modality: str = "text"
+    modality: str = "text",
+    speech_meta: Optional[Dict[str, Any]] = None,
 ):
     ts = now_ms()
     entry = {
@@ -367,6 +368,8 @@ def append_chat(
         "audio_url": audio_url,
         "modality": modality
     }
+    if speech_meta is not None:
+        entry["speech_meta"] = speech_meta
     u["chat"].append(entry)
 
     if role == "assistant":
@@ -566,39 +569,77 @@ def persist_assistant_output(
         set_typing(u, False)
         return
 
+    POSE_KEYS_COMPACT = (
+        "jaw_open",
+        "lip_round",
+        "lip_spread",
+        "lip_press",
+        "tongue_tip_up",
+        "tongue_tip_forward",
+        "tongue_tip_lateral",
+        "tongue_body_high",
+        "tongue_body_front",
+        "tongue_mid_arch",
+        "tongue_visible",
+    )
+
+    def compact_speech_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
+        timeline_in = meta.get("gesture_timeline") or []
+        timeline_out: list[Dict[str, Any]] = []
+        for fr in timeline_in:
+            if not isinstance(fr, dict):
+                continue
+            pose = fr.get("pose") if isinstance(fr.get("pose"), dict) else {}
+            pose_out = {k: float(pose.get(k, 0.0)) for k in POSE_KEYS_COMPACT}
+            timeline_out.append({
+                "t_ms": int(fr.get("t_ms", 0)),
+                "type": str(fr.get("type", "")),
+                "ipa": str(fr.get("ipa", "")),
+                "duration_ms": int(fr.get("duration_ms", 0)),
+                "pose": pose_out,
+            })
+        return {
+            "ipa_text": str(meta.get("ipa_text", "")),
+            "gesture_timeline": timeline_out,
+        }
+
+    first_voice_meta_compact: Optional[Dict[str, Any]] = None
+
     for item in assistant_messages:
         text = item["text"]
         modality = item["modality"]
         audio_url = None
+        speech_meta_compact = None
 
         if modality == "voice":
             audio_url = synthesize_speech(text)
             if not audio_url:
                 modality = "text"
+            else:
+                try:
+                    meta_full = text_to_speech_articulation(
+                        text=text,
+                        emotion="neutral",
+                        intensity=0.55,
+                    )
+                    speech_meta_compact = compact_speech_meta(meta_full)
+                    if first_voice_meta_compact is None:
+                        first_voice_meta_compact = speech_meta_compact
+                        u["last_speech_gesture_timeline"] = meta_full.get("gesture_timeline")
+                        u["last_speech_gesture_at_ms"] = now_ms()
+                except Exception as e:
+                    logger.warning("speech_meta: failed to compute articulation: %s", e)
 
         append_chat(
             u,
             "assistant",
             text,
             audio_url=audio_url,
-            modality=modality
+            modality=modality,
+            speech_meta=speech_meta_compact,
         )
         update_channel_preferences_on_assistant_reply(u, modality)
         maybe_record_affective_event_from_assistant(u, text)
-
-    # Guardar timeline de articulação da primeira mensagem em voz para robótica
-    first = assistant_messages[0]
-    if first.get("modality") == "voice" and first.get("text"):
-        try:
-            speech_meta = text_to_speech_articulation(
-                text=first["text"],
-                emotion="neutral",
-                intensity=0.55,
-            )
-            u["last_speech_gesture_timeline"] = speech_meta.get("gesture_timeline")
-            u["last_speech_gesture_at_ms"] = now_ms()
-        except Exception as e:
-            logger.warning("robotics: failed to store speech timeline: %s", e)
 
     consolidate_emotional_narratives(u)
     set_typing(u, False)

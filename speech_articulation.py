@@ -811,19 +811,19 @@ def gestures_to_timeline(
 ) -> List[Dict[str, Any]]:
     timeline: List[Dict[str, Any]] = []
 
-silence_pose = {
-    "jaw_open": 0.0,
-    "lip_round": 0.0,
-    "lip_spread": 0.0,
-    "lip_press": 0.1,
-    "tongue_tip_up": 0.0,
-    "tongue_tip_forward": 0.0,
-    "tongue_tip_lateral": 0.5,
-    "tongue_body_high": 0.0,
-    "tongue_body_front": 0.0,
-    "tongue_mid_arch": 0.0,
-    "tongue_visible": 0.0,
-}
+    silence_pose = {
+        "jaw_open": 0.0,
+        "lip_round": 0.0,
+        "lip_spread": 0.0,
+        "lip_press": 0.1,
+        "tongue_tip_up": 0.0,
+        "tongue_tip_forward": 0.0,
+        "tongue_tip_lateral": 0.5,
+        "tongue_body_high": 0.0,
+        "tongue_body_front": 0.0,
+        "tongue_mid_arch": 0.0,
+        "tongue_visible": 0.0,
+    }
 
     timeline.append({
         "t_ms": 0,
