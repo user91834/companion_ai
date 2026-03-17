@@ -54,8 +54,9 @@ class RelationshipStructureOut(BaseModel):
 
 class DeliveryPreferencesOut(BaseModel):
     inactive_delivery_mode: Literal["text", "audio", "both"] = "text"
-    allow_background_audio: bool = False
-    allow_lockscreen_audio: bool = False
+    auto_play_audio: bool = True  # reproduzir áudio do assistente automaticamente ao receber
+    allow_background_audio: bool = False  # permitir play com app em segundo plano
+    allow_lockscreen_audio: bool = False  # permitir play com tela desligada
     insistent_mode: bool = False
     quiet_hours_enabled: bool = True
     quiet_hours: Dict[str, str] = Field(

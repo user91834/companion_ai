@@ -807,15 +807,17 @@ def remember_delivery_preferences(
     u: Dict[str, Any],
     *,
     inactive_delivery_mode: str,
-    allow_background_audio: bool,
-    allow_lockscreen_audio: bool,
-    insistent_mode: bool,
+    auto_play_audio: bool = True,
+    allow_background_audio: bool = False,
+    allow_lockscreen_audio: bool = False,
+    insistent_mode: bool = False,
 ):
     add_operational_memory(
         u,
         (
             "Delivery preferences updated: "
             f"inactive_delivery_mode={inactive_delivery_mode}, "
+            f"auto_play_audio={auto_play_audio}, "
             f"allow_background_audio={allow_background_audio}, "
             f"allow_lockscreen_audio={allow_lockscreen_audio}, "
             f"insistent_mode={insistent_mode}"
@@ -824,6 +826,7 @@ def remember_delivery_preferences(
         importance=7,
         meta={
             "inactive_delivery_mode": inactive_delivery_mode,
+            "auto_play_audio": auto_play_audio,
             "allow_background_audio": allow_background_audio,
             "allow_lockscreen_audio": allow_lockscreen_audio,
             "insistent_mode": insistent_mode,

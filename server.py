@@ -80,7 +80,7 @@ from llm import (
     generate_llm_proactive_voice_message,
     should_proactive_be_voice,
 )
-from push import send_push_fcm
+from push import send_push_fcm, send_push_fcm_voice
 from database import init_db, test_connection, db_available
 from robotics import step_robotics_frame, start_kiss
 
@@ -241,6 +241,7 @@ def migrate_user_state(u: Dict[str, Any], user_id: str) -> Dict[str, Any]:
 
     u.setdefault("delivery_preferences", {
         "inactive_delivery_mode": "text",
+        "auto_play_audio": True,
         "allow_background_audio": False,
         "allow_lockscreen_audio": False,
         "insistent_mode": False,
@@ -251,6 +252,13 @@ def migrate_user_state(u: Dict[str, Any], user_id: str) -> Dict[str, Any]:
         },
         "respect_user_routine": True,
     })
+    # Migração: garantir que preferências de áudio existam
+    prefs = u.get("delivery_preferences", {})
+    if isinstance(prefs, dict):
+        prefs.setdefault("auto_play_audio", True)
+        prefs.setdefault("allow_background_audio", False)
+        prefs.setdefault("allow_lockscreen_audio", False)
+        u["delivery_preferences"] = prefs
 
     u.setdefault("temporal_context", build_temporal_context(u))
 
@@ -692,6 +700,7 @@ def get_user(user_id: str) -> Dict[str, Any]:
                 },
                 "delivery_preferences": {
                     "inactive_delivery_mode": "text",
+                    "auto_play_audio": True,
                     "allow_background_audio": False,
                     "allow_lockscreen_audio": False,
                     "insistent_mode": False,
@@ -1170,7 +1179,22 @@ def process_pending_replies():
 
                         if token and assistant_messages and should_send_proactive_push(u) and not has_sent_push_id(u, pending_id):
                             try:
-                                r = send_push_fcm(token, "Evelyn 💛", assistant_messages[0]["text"])
+                                first_msg = assistant_messages[0]
+                                msg_text = first_msg.get("text", "")
+                                audio_url = first_msg.get("audio_url")
+                                prefs = u.get("delivery_preferences", {})
+                                if audio_url and first_msg.get("modality") == "voice":
+                                    r = send_push_fcm_voice(
+                                        token,
+                                        "Evelyn 💛",
+                                        msg_text,
+                                        audio_url,
+                                        auto_play=bool(prefs.get("auto_play_audio", True)),
+                                        allow_background=bool(prefs.get("allow_background_audio", False)),
+                                        allow_lockscreen=bool(prefs.get("allow_lockscreen_audio", False)),
+                                    )
+                                else:
+                                    r = send_push_fcm(token, "Evelyn 💛", msg_text)
                                 if getattr(r, "status_code", 0) == 200:
                                     register_sent_push_id(u, pending_id)
                                     u["last_push_ts_ms"] = now_ms()
@@ -1307,8 +1331,20 @@ def maybe_send_proactive_messages():
                     continue
 
                 r = None
+                prefs = u.get("delivery_preferences", {})
                 try:
-                    r = send_push_fcm(token, "Evelyn 💛", text)
+                    if audio_url and modality == "voice":
+                        r = send_push_fcm_voice(
+                            token,
+                            "Evelyn 💛",
+                            text,
+                            audio_url,
+                            auto_play=bool(prefs.get("auto_play_audio", True)),
+                            allow_background=bool(prefs.get("allow_background_audio", False)),
+                            allow_lockscreen=bool(prefs.get("allow_lockscreen_audio", False)),
+                        )
+                    else:
+                        r = send_push_fcm(token, "Evelyn 💛", text)
                 except Exception as e:
                     logger.exception("FCM SEND ERROR: %s", e)
                     continue
@@ -1375,6 +1411,9 @@ def _merge_delivery_preferences(u: Dict[str, Any], payload: Dict[str, Any]):
 
     if "inactive_delivery_mode" in payload and payload["inactive_delivery_mode"] in {"text", "audio", "both"}:
         prefs["inactive_delivery_mode"] = payload["inactive_delivery_mode"]
+
+    if "auto_play_audio" in payload:
+        prefs["auto_play_audio"] = bool(payload["auto_play_audio"])
 
     if "allow_background_audio" in payload:
         prefs["allow_background_audio"] = bool(payload["allow_background_audio"])
@@ -1486,6 +1525,7 @@ def set_delivery_preferences(
         remember_delivery_preferences(
             u,
             inactive_delivery_mode=current.get("inactive_delivery_mode", "text"),
+            auto_play_audio=bool(current.get("auto_play_audio", True)),
             allow_background_audio=bool(current.get("allow_background_audio", False)),
             allow_lockscreen_audio=bool(current.get("allow_lockscreen_audio", False)),
             insistent_mode=bool(current.get("insistent_mode", False)),
